@@ -149,9 +149,9 @@ Run the CD pipeline manually with:
 
 - `rollback`: `true`
 - `rollbackEnvironment`: `dev`, `uat`, or `prod`
-- `previousImageTag`: the previously known-good commit SHA tag in ACR
+- `previousImageTag`: the previously deployed, known-good commit SHA tag stored in ACR
 
-Rollback mode skips normal promotion, updates the selected environment's GitOps file to the supplied previous tag, and commits the change with `[skip ci]`. Argo CD then redeploys that image. Production still requires the manual Argo CD sync configured for the production Application.
+Rollback mode skips normal promotion and updates only the selected Helm `values.yaml` file with the supplied previous image tag. It commits the change with `[skip ci]`, after which Argo CD redeploys that image. Production still requires the manual Argo CD sync configured for the production Application.
 
 ## Argo CD GitOps
 
