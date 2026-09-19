@@ -1,0 +1,12 @@
+subscription_id         = "00000000-0000-0000-0000-000000000000"
+resource_group_name     = "rg-db-health-check"
+location                = "eastus"
+app_name                = "dbhealth"
+aks_node_count          = 2
+aks_vm_size             = "Standard_D2s_v5"
+postgres_admin_login    = "appadmin"
+postgres_database_name  = "healthdb"
+
+# Supply this through a secure tfvars file, environment variable, or pipeline secret.
+# Do not commit the real password.
+postgres_admin_password = "REPLACE_WITH_SECRET"

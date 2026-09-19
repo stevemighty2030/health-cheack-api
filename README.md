@@ -10,13 +10,36 @@ A containerized FastAPI health-check service with PostgreSQL, Nginx, Azure DevOp
 - Docker Compose local development
 - Azure DevOps CI with testing, linting, secret scanning, SCA, SAST, and image publishing
 - Argo CD deployment to dev, UAT, and production
+ Terraform infrastructure for the network, AKS, PostgreSQL, ACR, Key Vault, and RBAC
 
-## Requirements
+ Task 3 is in [task-3-infrastructure](task-3-infrastructure/). The Terraform configuration defines:
 
 ### Local development
+### Security design
 
+- No password is hardcoded in Terraform. `postgres_admin_password` is sensitive and is stored in Key Vault.
+- The AKS kubelet identity receives only `AcrPull` on this ACR.
+- The Key Vault Secrets Provider identity receives only read access to Key Vault secrets.
+- PostgreSQL has public network access disabled and runs in the private database subnet.
+- The public subnet allows only TCP 443 through its network security group.
+- AKS uses Azure RBAC, workload identity, and the Key Vault Secrets Provider.
+
+### Deployment review
+
+Terraform can be reviewed without an Azure account. Initialize and validate without a backend:
+
+```bash
+terraform -chdir=task-3-infrastructure init -backend=false
+terraform -chdir=task-3-infrastructure validate
+```
+
+Copy `task-3-infrastructure/terraform.tfvars.example` to a local ignored `.tfvars` file, replace the resource group and subscription values, and provide the PostgreSQL password through a secure variable. Never commit the real password.
 - Docker and Docker Compose
-- Python 3.12 or newer for local validation
+ │   ├── main.tf
+ │   ├── variables.tf
+ │   ├── versions.tf
+ │   ├── outputs.tf
+ │   └── terraform.tfvars.example
 
 ### CI/CD and deployment
 
@@ -173,6 +196,37 @@ environments/prod
 
 Each environment is a Helm chart or Helm chart values path monitored by Argo CD. The CD pipeline edits only the configured `values.yaml` files.
 
+## Infrastructure as Code
+
+Task 3 is in [task-3-infrastructure](task-3-infrastructure/). The Terraform configuration defines:
+
+- Public, AKS, and private database subnets in one virtual network.
+- AKS compute for running the container.
+- Private Azure Database for PostgreSQL Flexible Server.
+- ACR with the AKS kubelet limited to the `AcrPull` role.
+- Key Vault with RBAC and secure PostgreSQL secret storage.
+- AKS workload identity, Key Vault Secrets Provider, monitoring, and least-privilege access.
+
+### Security design
+
+- No password is hardcoded in Terraform. `postgres_admin_password` is sensitive and is stored in Key Vault.
+- The AKS kubelet identity receives only `AcrPull` on this ACR.
+- The Key Vault Secrets Provider identity receives only read access to Key Vault secrets.
+- PostgreSQL has public network access disabled and runs in the private database subnet.
+- The public subnet allows only TCP 443 through its network security group.
+- AKS uses Azure RBAC, workload identity, and the Key Vault Secrets Provider.
+
+### Deployment review
+
+Terraform can be reviewed without an Azure account. Initialize and validate without a backend:
+
+```bash
+terraform -chdir=task-3-infrastructure init -backend=false
+terraform -chdir=task-3-infrastructure validate
+```
+
+Copy `task-3-infrastructure/terraform.tfvars.example` to a local ignored `.tfvars` file, replace the resource group and subscription values, and provide the PostgreSQL password through a secure variable. Never commit the real password.
+
 ## Repository Structure
 
 ```text
@@ -186,6 +240,17 @@ Each environment is a Helm chart or Helm chart values path monitored by Argo CD.
 │   ├── azure-pipelines-ci.yml
 │   ├── azure-pipelines-cd.yml
 │   └── gitops/argocd/application.yaml
+├── task-3-infrastructure/
+│   ├── main.tf
+│   ├── variables.tf
+│   ├── versions.tf
+│   ├── outputs.tf
+│   ├── terraform.tfvars.example
+│   ├── main.tf
+│   ├── variables.tf
+│   ├── versions.tf
+│   ├── outputs.tf
+│   └── terraform.tfvars.example
 ├── Dockerfile
 ├── docker-compose.yml
 ├── nginx.conf
