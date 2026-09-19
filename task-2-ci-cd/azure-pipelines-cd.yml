@@ -3,14 +3,34 @@
 #   GITOPS_REPOSITORY: clone URL of the external GitOps repository
 #   GITOPS_BRANCH: branch watched by Argo CD, normally main
 #   GITOPS_TOKEN: secret PAT with repository push permission
-#   GITOPS_UPDATE_MODE: helm-values or manifest
-#   GITOPS_FILE_DEV: dev values or manifest path
-#   GITOPS_FILE_UAT: UAT values or manifest path
-#   GITOPS_FILE_PROD: production values or manifest path
+#   GITOPS_VALUES_FILE_DEV: dev Helm values.yaml path
+#   GITOPS_VALUES_FILE_UAT: UAT Helm values.yaml path
+#   GITOPS_VALUES_FILE_PROD: production Helm values.yaml path
 #   COSIGN_PUBLIC_KEY: public key matching the CI signing key
 
 trigger: none
 pr: none
+
+# Set rollback to true when manually running this pipeline to restore a prior image.
+# Leave rollback false for the normal verified dev -> UAT -> production promotion.
+parameters:
+  - name: rollback
+    displayName: Roll back a deployment
+    type: boolean
+    default: false
+  - name: rollbackEnvironment
+    displayName: Rollback environment
+    type: string
+    default: prod
+    values:
+      - dev
+      - uat
+      - prod
+  - name: previousImageTag
+    displayName: Previous image tag
+    # Enter the previously deployed, known-good commit SHA stored in ACR.
+    type: string
+    default: ''
 
 resources:
   pipelines:
@@ -32,6 +52,8 @@ stages:
   # Verify the image and signature from the exact CI run before any promotion.
   - stage: VerifyImage
     displayName: Verify CI image signature
+    # Rollbacks use an existing trusted tag and do not need the new CI artifact.
+    condition: and(succeeded(), eq('${{ parameters.rollback }}', 'false'))
     jobs:
       - job: VerifyImage
         displayName: Verify Cosign signature
@@ -85,7 +107,8 @@ stages:
   - stage: DeployDev
     displayName: Deploy to dev through GitOps
     dependsOn: VerifyImage
-    condition: succeeded()
+    # Argo CD automatically syncs dev after this GitOps commit.
+    condition: and(succeeded(), eq('${{ parameters.rollback }}', 'false'))
     jobs:
       - job: DeployDev
         displayName: Update dev GitOps file
@@ -105,24 +128,17 @@ stages:
               import os
               import re
 
-              file_path = Path(os.environ['GITOPS_FILE'])
+                file_path = Path(os.environ['GITOPS_VALUES_FILE'])
               contents = file_path.read_text()
               image = os.environ['IMAGE']
               tag = os.environ['IMAGE_TAG']
-              if os.environ['GITOPS_UPDATE_MODE'] == 'helm-values':
-                  updated, repository_count = re.subn(r'(?m)^(\s*repository:\s*).+$', rf'\g<1>{image}', contents, count=1)
-                  updated, tag_count = re.subn(r'(?m)^(\s*tag:\s*).+$', rf'\g<1>{tag}', updated, count=1)
-                  count = repository_count + tag_count
-              elif os.environ['GITOPS_UPDATE_MODE'] == 'manifest':
-                  updated, count = re.subn(r'(?m)^(\s*image:\s*).+$', rf'\g<1>{image}:{tag}', contents, count=1)
-              else:
-                  raise SystemExit('GITOPS_UPDATE_MODE must be helm-values or manifest')
-              expected = 2 if os.environ['GITOPS_UPDATE_MODE'] == 'helm-values' else 1
-              if count != expected:
-                  raise SystemExit(f'Expected {expected} image fields in {file_path}, found {count}')
+                updated, repository_count = re.subn(r'(?m)^(\s*repository:\s*).+$', rf'\g<1>{image}', contents, count=1)
+                updated, tag_count = re.subn(r'(?m)^(\s*tag:\s*).+$', rf'\g<1>{tag}', updated, count=1)
+                if repository_count + tag_count != 2:
+                  raise SystemExit(f'Expected repository and tag fields in {file_path}')
               file_path.write_text(updated)
               PY
-              git add "${GITOPS_FILE}"
+                git add "${GITOPS_VALUES_FILE}"
               git diff --cached --quiet && echo "Dev already uses ${IMAGE_TAG}" && exit 0
               git commit -m "Promote ${IMAGE_TAG} to dev [skip ci]"
               git -c http.extraheader="AUTHORIZATION: Basic ${auth_header}" push origin "${GITOPS_BRANCH:-main}"
@@ -131,8 +147,7 @@ stages:
               GITOPS_REPOSITORY: $(GITOPS_REPOSITORY)
               GITOPS_BRANCH: $(GITOPS_BRANCH)
               GITOPS_TOKEN: $(GITOPS_TOKEN)
-              GITOPS_UPDATE_MODE: $(GITOPS_UPDATE_MODE)
-              GITOPS_FILE: $(GITOPS_FILE_DEV)
+              GITOPS_VALUES_FILE: $(GITOPS_VALUES_FILE_DEV)
               IMAGE: $(ACR_LOGIN_SERVER)/$(imageRepository)
               IMAGE_TAG: $(resources.pipeline.ci.sourceCommit)
 
@@ -140,7 +155,8 @@ stages:
   - stage: DeployUat
     displayName: Deploy to UAT through GitOps
     dependsOn: DeployDev
-    condition: succeeded()
+    # UAT is promoted only after the dev GitOps update succeeds.
+    condition: and(succeeded(), eq('${{ parameters.rollback }}', 'false'))
     jobs:
       - job: DeployUat
         displayName: Update UAT GitOps file
@@ -160,24 +176,17 @@ stages:
               import os
               import re
 
-              file_path = Path(os.environ['GITOPS_FILE'])
+                file_path = Path(os.environ['GITOPS_VALUES_FILE'])
               contents = file_path.read_text()
               image = os.environ['IMAGE']
               tag = os.environ['IMAGE_TAG']
-              if os.environ['GITOPS_UPDATE_MODE'] == 'helm-values':
-                  updated, repository_count = re.subn(r'(?m)^(\s*repository:\s*).+$', rf'\g<1>{image}', contents, count=1)
-                  updated, tag_count = re.subn(r'(?m)^(\s*tag:\s*).+$', rf'\g<1>{tag}', updated, count=1)
-                  count = repository_count + tag_count
-              elif os.environ['GITOPS_UPDATE_MODE'] == 'manifest':
-                  updated, count = re.subn(r'(?m)^(\s*image:\s*).+$', rf'\g<1>{image}:{tag}', contents, count=1)
-              else:
-                  raise SystemExit('GITOPS_UPDATE_MODE must be helm-values or manifest')
-              expected = 2 if os.environ['GITOPS_UPDATE_MODE'] == 'helm-values' else 1
-              if count != expected:
-                  raise SystemExit(f'Expected {expected} image fields in {file_path}, found {count}')
+                updated, repository_count = re.subn(r'(?m)^(\s*repository:\s*).+$', rf'\g<1>{image}', contents, count=1)
+                updated, tag_count = re.subn(r'(?m)^(\s*tag:\s*).+$', rf'\g<1>{tag}', updated, count=1)
+                if repository_count + tag_count != 2:
+                  raise SystemExit(f'Expected repository and tag fields in {file_path}')
               file_path.write_text(updated)
               PY
-              git add "${GITOPS_FILE}"
+                git add "${GITOPS_VALUES_FILE}"
               git diff --cached --quiet && echo "UAT already uses ${IMAGE_TAG}" && exit 0
               git commit -m "Promote ${IMAGE_TAG} to UAT [skip ci]"
               git -c http.extraheader="AUTHORIZATION: Basic ${auth_header}" push origin "${GITOPS_BRANCH:-main}"
@@ -186,8 +195,7 @@ stages:
               GITOPS_REPOSITORY: $(GITOPS_REPOSITORY)
               GITOPS_BRANCH: $(GITOPS_BRANCH)
               GITOPS_TOKEN: $(GITOPS_TOKEN)
-              GITOPS_UPDATE_MODE: $(GITOPS_UPDATE_MODE)
-              GITOPS_FILE: $(GITOPS_FILE_UAT)
+              GITOPS_VALUES_FILE: $(GITOPS_VALUES_FILE_UAT)
               IMAGE: $(ACR_LOGIN_SERVER)/$(imageRepository)
               IMAGE_TAG: $(resources.pipeline.ci.sourceCommit)
 
@@ -195,7 +203,8 @@ stages:
   - stage: Approval
     displayName: Approve production promotion
     dependsOn: DeployUat
-    condition: succeeded()
+    # Production approval is reached only after dev and UAT promotion.
+    condition: and(succeeded(), eq('${{ parameters.rollback }}', 'false'))
     jobs:
       - job: ManualApproval
         displayName: Manual production approval
@@ -212,7 +221,8 @@ stages:
   - stage: DeployProd
     displayName: Deploy to production through GitOps
     dependsOn: Approval
-    condition: succeeded()
+    # Argo CD production auto-sync is disabled; this commit is followed by manual sync.
+    condition: and(succeeded(), eq('${{ parameters.rollback }}', 'false'))
     jobs:
       - job: DeployProd
         displayName: Update production GitOps file
@@ -232,24 +242,17 @@ stages:
               import os
               import re
 
-              file_path = Path(os.environ['GITOPS_FILE'])
+                file_path = Path(os.environ['GITOPS_VALUES_FILE'])
               contents = file_path.read_text()
               image = os.environ['IMAGE']
               tag = os.environ['IMAGE_TAG']
-              if os.environ['GITOPS_UPDATE_MODE'] == 'helm-values':
-                  updated, repository_count = re.subn(r'(?m)^(\s*repository:\s*).+$', rf'\g<1>{image}', contents, count=1)
-                  updated, tag_count = re.subn(r'(?m)^(\s*tag:\s*).+$', rf'\g<1>{tag}', updated, count=1)
-                  count = repository_count + tag_count
-              elif os.environ['GITOPS_UPDATE_MODE'] == 'manifest':
-                  updated, count = re.subn(r'(?m)^(\s*image:\s*).+$', rf'\g<1>{image}:{tag}', contents, count=1)
-              else:
-                  raise SystemExit('GITOPS_UPDATE_MODE must be helm-values or manifest')
-              expected = 2 if os.environ['GITOPS_UPDATE_MODE'] == 'helm-values' else 1
-              if count != expected:
-                  raise SystemExit(f'Expected {expected} image fields in {file_path}, found {count}')
+                updated, repository_count = re.subn(r'(?m)^(\s*repository:\s*).+$', rf'\g<1>{image}', contents, count=1)
+                updated, tag_count = re.subn(r'(?m)^(\s*tag:\s*).+$', rf'\g<1>{tag}', updated, count=1)
+                if repository_count + tag_count != 2:
+                  raise SystemExit(f'Expected repository and tag fields in {file_path}')
               file_path.write_text(updated)
               PY
-              git add "${GITOPS_FILE}"
+                git add "${GITOPS_VALUES_FILE}"
               git diff --cached --quiet && echo "Production already uses ${IMAGE_TAG}" && exit 0
               git commit -m "Promote ${IMAGE_TAG} to production [skip ci]"
               git -c http.extraheader="AUTHORIZATION: Basic ${auth_header}" push origin "${GITOPS_BRANCH:-main}"
@@ -258,7 +261,68 @@ stages:
               GITOPS_REPOSITORY: $(GITOPS_REPOSITORY)
               GITOPS_BRANCH: $(GITOPS_BRANCH)
               GITOPS_TOKEN: $(GITOPS_TOKEN)
-              GITOPS_UPDATE_MODE: $(GITOPS_UPDATE_MODE)
-              GITOPS_FILE: $(GITOPS_FILE_PROD)
+              GITOPS_VALUES_FILE: $(GITOPS_VALUES_FILE_PROD)
               IMAGE: $(ACR_LOGIN_SERVER)/$(imageRepository)
               IMAGE_TAG: $(resources.pipeline.ci.sourceCommit)
+
+  # Manual rollback mode skips normal promotion and restores the supplied previous
+  # image tag by updating the selected Helm values.yaml file.
+  # Argo CD then reconciles the selected environment back to that image.
+  - stage: Rollback
+    displayName: Roll back a previous image
+    # This stage runs only when the pipeline is manually started with rollback=true.
+    condition: and(succeeded(), eq('${{ parameters.rollback }}', 'true'))
+    jobs:
+      - job: Rollback
+        displayName: Restore previous image tag
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: none
+          - bash: |
+              set -euo pipefail
+              # The operator must provide a known-good tag already available in ACR.
+              test -n "${ROLLBACK_IMAGE_TAG}"
+              # Select only the environment file requested by the manual run.
+              case "${ROLLBACK_ENVIRONMENT}" in
+                dev) gitops_file="${GITOPS_VALUES_FILE_DEV}" ;;
+                uat) gitops_file="${GITOPS_VALUES_FILE_UAT}" ;;
+                prod) gitops_file="${GITOPS_VALUES_FILE_PROD}" ;;
+                *) echo "Unsupported rollback environment" >&2; exit 1 ;;
+              esac
+              export GITOPS_FILE="${gitops_file}"
+              # Update GitOps; Argo CD will reconcile the selected environment.
+              auth_header=$(printf ':%s' "${GITOPS_TOKEN}" | base64 -w 0)
+              git -c http.extraheader="AUTHORIZATION: Basic ${auth_header}" clone --branch "${GITOPS_BRANCH:-main}" "${GITOPS_REPOSITORY}" gitops-repo
+              cd gitops-repo
+              git config user.name "Azure DevOps"
+              git config user.email "azuredevops@local"
+              python - <<'PY'
+              from pathlib import Path
+              import os
+              import re
+
+                file_path = Path(os.environ['GITOPS_FILE'])
+              contents = file_path.read_text()
+              tag = os.environ['ROLLBACK_IMAGE_TAG']
+                updated, count = re.subn(r'(?m)^(\s*tag:\s*).+$', rf'\g<1>{tag}', contents, count=1)
+              if count != 1:
+                  raise SystemExit(f'Expected one Helm tag field in {file_path}, found {count}')
+              file_path.write_text(updated)
+              PY
+              git add "${gitops_file}"
+              git diff --cached --quiet && echo "${ROLLBACK_ENVIRONMENT} already uses ${ROLLBACK_IMAGE_TAG}" && exit 0
+              git commit -m "Roll back ${ROLLBACK_ENVIRONMENT} to ${ROLLBACK_IMAGE_TAG} [skip ci]"
+              git -c http.extraheader="AUTHORIZATION: Basic ${auth_header}" push origin "${GITOPS_BRANCH:-main}"
+            displayName: Commit rollback image tag
+            env:
+              GITOPS_REPOSITORY: $(GITOPS_REPOSITORY)
+              GITOPS_BRANCH: $(GITOPS_BRANCH)
+              GITOPS_TOKEN: $(GITOPS_TOKEN)
+              GITOPS_VALUES_FILE_DEV: $(GITOPS_VALUES_FILE_DEV)
+              GITOPS_VALUES_FILE_UAT: $(GITOPS_VALUES_FILE_UAT)
+              GITOPS_VALUES_FILE_PROD: $(GITOPS_VALUES_FILE_PROD)
+              ROLLBACK_ENVIRONMENT: ${{ parameters.rollbackEnvironment }}
+              ROLLBACK_IMAGE_TAG: ${{ parameters.previousImageTag }}
+              GITOPS_FILE: $(GITOPS_VALUES_FILE_PROD)
+              IMAGE: $(ACR_LOGIN_SERVER)/$(imageRepository)
