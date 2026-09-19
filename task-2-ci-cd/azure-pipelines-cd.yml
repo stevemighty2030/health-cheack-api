@@ -1,10 +1,13 @@
-# Azure DevOps CD pipeline: approval-gated GitOps promotion.
-# Create an Azure DevOps variable group named "db-health-check-cd" with:
-#   GITOPS_REPOSITORY: clone URL of the GitOps repository
-#   GITOPS_BRANCH: branch watched by Argo CD (default: main)
-#   GITOPS_TOKEN: secret PAT with permission to push that repository
+# Azure DevOps CD pipeline: verified GitOps promotion through dev, UAT, and production.
+# Create variable group "db-health-check-cd" with:
+#   GITOPS_REPOSITORY: clone URL of the external GitOps repository
+#   GITOPS_BRANCH: branch watched by Argo CD, normally main
+#   GITOPS_TOKEN: secret PAT with repository push permission
 #   GITOPS_UPDATE_MODE: helm-values or manifest
-#   GITOPS_FILE: path in the GitOps repository to the values or manifest file
+#   GITOPS_FILE_DEV: dev values or manifest path
+#   GITOPS_FILE_UAT: UAT values or manifest path
+#   GITOPS_FILE_PROD: production values or manifest path
+#   COSIGN_PUBLIC_KEY: public key matching the CI signing key
 
 trigger: none
 pr: none
@@ -22,10 +25,177 @@ variables:
   - group: db-health-check-cd
   - name: imageRepository
     value: db-health-check
+  - name: cosignVersion
+    value: '2.4.1'
 
 stages:
+  # Verify the image and signature from the exact CI run before any promotion.
+  - stage: VerifyImage
+    displayName: Verify CI image signature
+    jobs:
+      - job: VerifyImage
+        displayName: Verify Cosign signature
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: none
+          - task: DownloadPipelineArtifact@2
+            # Pin both downloads to the CI run that triggered this CD pipeline.
+            displayName: Download CI image artifact
+            inputs:
+              buildType: specific
+              project: $(System.TeamProjectId)
+              definition: $(resources.pipeline.ci.pipelineID)
+              specificBuildWithTriggering: true
+              buildVersionToDownload: specific
+              pipelineId: $(resources.pipeline.ci.runID)
+              artifactName: db-health-check-image
+              targetPath: $(Pipeline.Workspace)/db-health-check-image
+          - task: DownloadPipelineArtifact@2
+            displayName: Download CI Cosign signature
+            inputs:
+              buildType: specific
+              project: $(System.TeamProjectId)
+              definition: $(resources.pipeline.ci.pipelineID)
+              specificBuildWithTriggering: true
+              buildVersionToDownload: specific
+              pipelineId: $(resources.pipeline.ci.runID)
+              artifactName: db-health-check-signature
+              targetPath: $(Pipeline.Workspace)/db-health-check-signature
+          - bash: |
+              # Verify the public-key signature against the exact CI image tarball.
+              # A missing file or mismatch exits nonzero and blocks every deployment.
+              set -euo pipefail
+              test -s "$(Pipeline.Workspace)/db-health-check-image/db-health-check.tar"
+              test -s "$(Pipeline.Workspace)/db-health-check-signature/db-health-check.tar.sig"
+              docker run --rm \
+                -e COSIGN_PUBLIC_KEY \
+                -v "$(Pipeline.Workspace)/db-health-check-image:/image" \
+                -v "$(Pipeline.Workspace)/db-health-check-signature:/signature" \
+                gcr.io/projectsigstore/cosign:v$(cosignVersion) \
+                verify-blob \
+                --key env://COSIGN_PUBLIC_KEY \
+                --signature /signature/db-health-check.tar.sig \
+                /image/db-health-check.tar
+            displayName: Fail if image signature is missing or mismatched
+            env:
+              COSIGN_PUBLIC_KEY: $(COSIGN_PUBLIC_KEY)
+
+  # Dev auto-syncs in Argo CD after this GitOps commit.
+  - stage: DeployDev
+    displayName: Deploy to dev through GitOps
+    dependsOn: VerifyImage
+    condition: succeeded()
+    jobs:
+      - job: DeployDev
+        displayName: Update dev GitOps file
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: none
+          - bash: |
+              set -euo pipefail
+              auth_header=$(printf ':%s' "${GITOPS_TOKEN}" | base64 -w 0)
+              git -c http.extraheader="AUTHORIZATION: Basic ${auth_header}" clone --branch "${GITOPS_BRANCH:-main}" "${GITOPS_REPOSITORY}" gitops-repo
+              cd gitops-repo
+              git config user.name "Azure DevOps"
+              git config user.email "azuredevops@local"
+              python - <<'PY'
+              from pathlib import Path
+              import os
+              import re
+
+              file_path = Path(os.environ['GITOPS_FILE'])
+              contents = file_path.read_text()
+              image = os.environ['IMAGE']
+              tag = os.environ['IMAGE_TAG']
+              if os.environ['GITOPS_UPDATE_MODE'] == 'helm-values':
+                  updated, repository_count = re.subn(r'(?m)^(\s*repository:\s*).+$', rf'\g<1>{image}', contents, count=1)
+                  updated, tag_count = re.subn(r'(?m)^(\s*tag:\s*).+$', rf'\g<1>{tag}', updated, count=1)
+                  count = repository_count + tag_count
+              elif os.environ['GITOPS_UPDATE_MODE'] == 'manifest':
+                  updated, count = re.subn(r'(?m)^(\s*image:\s*).+$', rf'\g<1>{image}:{tag}', contents, count=1)
+              else:
+                  raise SystemExit('GITOPS_UPDATE_MODE must be helm-values or manifest')
+              expected = 2 if os.environ['GITOPS_UPDATE_MODE'] == 'helm-values' else 1
+              if count != expected:
+                  raise SystemExit(f'Expected {expected} image fields in {file_path}, found {count}')
+              file_path.write_text(updated)
+              PY
+              git add "${GITOPS_FILE}"
+              git diff --cached --quiet && echo "Dev already uses ${IMAGE_TAG}" && exit 0
+              git commit -m "Promote ${IMAGE_TAG} to dev [skip ci]"
+              git -c http.extraheader="AUTHORIZATION: Basic ${auth_header}" push origin "${GITOPS_BRANCH:-main}"
+            displayName: Commit dev image update
+            env:
+              GITOPS_REPOSITORY: $(GITOPS_REPOSITORY)
+              GITOPS_BRANCH: $(GITOPS_BRANCH)
+              GITOPS_TOKEN: $(GITOPS_TOKEN)
+              GITOPS_UPDATE_MODE: $(GITOPS_UPDATE_MODE)
+              GITOPS_FILE: $(GITOPS_FILE_DEV)
+              IMAGE: $(ACR_LOGIN_SERVER)/$(imageRepository)
+              IMAGE_TAG: $(resources.pipeline.ci.sourceCommit)
+
+  # UAT auto-syncs after dev succeeds and the GitOps update is committed.
+  - stage: DeployUat
+    displayName: Deploy to UAT through GitOps
+    dependsOn: DeployDev
+    condition: succeeded()
+    jobs:
+      - job: DeployUat
+        displayName: Update UAT GitOps file
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: none
+          - bash: |
+              set -euo pipefail
+              auth_header=$(printf ':%s' "${GITOPS_TOKEN}" | base64 -w 0)
+              git -c http.extraheader="AUTHORIZATION: Basic ${auth_header}" clone --branch "${GITOPS_BRANCH:-main}" "${GITOPS_REPOSITORY}" gitops-repo
+              cd gitops-repo
+              git config user.name "Azure DevOps"
+              git config user.email "azuredevops@local"
+              python - <<'PY'
+              from pathlib import Path
+              import os
+              import re
+
+              file_path = Path(os.environ['GITOPS_FILE'])
+              contents = file_path.read_text()
+              image = os.environ['IMAGE']
+              tag = os.environ['IMAGE_TAG']
+              if os.environ['GITOPS_UPDATE_MODE'] == 'helm-values':
+                  updated, repository_count = re.subn(r'(?m)^(\s*repository:\s*).+$', rf'\g<1>{image}', contents, count=1)
+                  updated, tag_count = re.subn(r'(?m)^(\s*tag:\s*).+$', rf'\g<1>{tag}', updated, count=1)
+                  count = repository_count + tag_count
+              elif os.environ['GITOPS_UPDATE_MODE'] == 'manifest':
+                  updated, count = re.subn(r'(?m)^(\s*image:\s*).+$', rf'\g<1>{image}:{tag}', contents, count=1)
+              else:
+                  raise SystemExit('GITOPS_UPDATE_MODE must be helm-values or manifest')
+              expected = 2 if os.environ['GITOPS_UPDATE_MODE'] == 'helm-values' else 1
+              if count != expected:
+                  raise SystemExit(f'Expected {expected} image fields in {file_path}, found {count}')
+              file_path.write_text(updated)
+              PY
+              git add "${GITOPS_FILE}"
+              git diff --cached --quiet && echo "UAT already uses ${IMAGE_TAG}" && exit 0
+              git commit -m "Promote ${IMAGE_TAG} to UAT [skip ci]"
+              git -c http.extraheader="AUTHORIZATION: Basic ${auth_header}" push origin "${GITOPS_BRANCH:-main}"
+            displayName: Commit UAT image update
+            env:
+              GITOPS_REPOSITORY: $(GITOPS_REPOSITORY)
+              GITOPS_BRANCH: $(GITOPS_BRANCH)
+              GITOPS_TOKEN: $(GITOPS_TOKEN)
+              GITOPS_UPDATE_MODE: $(GITOPS_UPDATE_MODE)
+              GITOPS_FILE: $(GITOPS_FILE_UAT)
+              IMAGE: $(ACR_LOGIN_SERVER)/$(imageRepository)
+              IMAGE_TAG: $(resources.pipeline.ci.sourceCommit)
+
+  # Production Argo CD has auto-sync disabled, and Azure DevOps adds an approval gate too.
   - stage: Approval
     displayName: Approve production promotion
+    dependsOn: DeployUat
+    condition: succeeded()
     jobs:
       - job: ManualApproval
         displayName: Manual production approval
@@ -36,21 +206,20 @@ stages:
             timeoutInMinutes: 1440
             inputs:
               notifyUsers: '$(Build.RequestedForEmail)'
-              instructions: 'Review the CI run, image $(resources.pipeline.ci.runID), and production change. Resume to promote through GitOps.'
+              instructions: 'Review dev and UAT, then approve production promotion for image $(resources.pipeline.ci.sourceCommit).'
               onTimeout: reject
 
-  - stage: Promote
-    displayName: Update GitOps repository
+  - stage: DeployProd
+    displayName: Deploy to production through GitOps
     dependsOn: Approval
     condition: succeeded()
     jobs:
-      - job: UpdateGitOps
-        displayName: Commit approved image tag
+      - job: DeployProd
+        displayName: Update production GitOps file
         pool:
           vmImage: ubuntu-latest
         steps:
           - checkout: none
-
           - bash: |
               set -euo pipefail
               auth_header=$(printf ':%s' "${GITOPS_TOKEN}" | base64 -w 0)
@@ -58,7 +227,6 @@ stages:
               cd gitops-repo
               git config user.name "Azure DevOps"
               git config user.email "azuredevops@local"
-
               python - <<'PY'
               from pathlib import Path
               import os
@@ -68,47 +236,29 @@ stages:
               contents = file_path.read_text()
               image = os.environ['IMAGE']
               tag = os.environ['IMAGE_TAG']
-
               if os.environ['GITOPS_UPDATE_MODE'] == 'helm-values':
-                  updated, repository_count = re.subn(
-                      r'(?m)^(\s*repository:\s*).+$',
-                      rf'\g<1>{image}',
-                      contents,
-                      count=1,
-                  )
-                  updated, tag_count = re.subn(
-                      r'(?m)^(\s*tag:\s*).+$',
-                      rf'\g<1>{tag}',
-                      updated,
-                      count=1,
-                  )
+                  updated, repository_count = re.subn(r'(?m)^(\s*repository:\s*).+$', rf'\g<1>{image}', contents, count=1)
+                  updated, tag_count = re.subn(r'(?m)^(\s*tag:\s*).+$', rf'\g<1>{tag}', updated, count=1)
                   count = repository_count + tag_count
               elif os.environ['GITOPS_UPDATE_MODE'] == 'manifest':
-                  updated, count = re.subn(
-                      r'(?m)^(\s*image:\s*).+$',
-                      rf'\g<1>{image}:{tag}',
-                      contents,
-                      count=1,
-                  )
+                  updated, count = re.subn(r'(?m)^(\s*image:\s*).+$', rf'\g<1>{image}:{tag}', contents, count=1)
               else:
                   raise SystemExit('GITOPS_UPDATE_MODE must be helm-values or manifest')
-
               expected = 2 if os.environ['GITOPS_UPDATE_MODE'] == 'helm-values' else 1
               if count != expected:
                   raise SystemExit(f'Expected {expected} image fields in {file_path}, found {count}')
               file_path.write_text(updated)
               PY
-
               git add "${GITOPS_FILE}"
-              git diff --cached --quiet && echo "GitOps already uses ${IMAGE_TAG}" && exit 0
+              git diff --cached --quiet && echo "Production already uses ${IMAGE_TAG}" && exit 0
               git commit -m "Promote ${IMAGE_TAG} to production [skip ci]"
               git -c http.extraheader="AUTHORIZATION: Basic ${auth_header}" push origin "${GITOPS_BRANCH:-main}"
-            displayName: Commit image tag to GitOps
+            displayName: Commit production image update
             env:
               GITOPS_REPOSITORY: $(GITOPS_REPOSITORY)
               GITOPS_BRANCH: $(GITOPS_BRANCH)
               GITOPS_TOKEN: $(GITOPS_TOKEN)
               GITOPS_UPDATE_MODE: $(GITOPS_UPDATE_MODE)
-              GITOPS_FILE: $(GITOPS_FILE)
+              GITOPS_FILE: $(GITOPS_FILE_PROD)
               IMAGE: $(ACR_LOGIN_SERVER)/$(imageRepository)
               IMAGE_TAG: $(resources.pipeline.ci.sourceCommit)
