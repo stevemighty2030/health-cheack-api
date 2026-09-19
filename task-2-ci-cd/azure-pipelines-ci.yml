@@ -67,7 +67,7 @@ stages:
               python -m compileall -q app tests verify_app.py
             displayName: Run lint and syntax checks
 
-  # Scan the complete Git history so secrets from older commits are also found.
+  # Scan the complete Git history; any detected secret must fail the pipeline.
   - stage: SecretScan
     displayName: Gitleaks secret scan
     jobs:
@@ -82,7 +82,7 @@ stages:
               docker run --rm \
                 -v "$(Build.SourcesDirectory):/repo" \
                 zricethezav/gitleaks:v$(gitleaksVersion) \
-                detect --source=/repo --no-banner --redact
+                detect --source=/repo --no-banner --redact --exit-code 1
             displayName: Run Gitleaks
 
   # SonarQube evaluates source and dependency findings and publishes its gate.
@@ -148,7 +148,7 @@ stages:
               targetPath: $(Build.ArtifactStagingDirectory)/db-health-check.tar
               artifact: db-health-check-image
 
-  # Scan the exported image; do not rebuild so the scanned artifact is immutable.
+  # Scan the exported image; any vulnerability fails the pipeline.
   - stage: Trivy
     displayName: Trivy image security scan
     dependsOn: BuildImage
@@ -171,7 +171,7 @@ stages:
               docker run --rm \
                 -v /var/run/docker.sock:/var/run/docker.sock \
                 aquasec/trivy:$(trivyVersion) \
-                image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed \
+                image --scanners vuln --exit-code 1 \
                 "$(imageRepository):$(Build.SourceVersion)"
             displayName: Run Trivy against build image
 

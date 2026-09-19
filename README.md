@@ -85,13 +85,13 @@ The pipeline runs for pull requests and pushes to `main`:
 | --- | --- |
 | `UnitTests` | Install dependencies and run `pytest`. |
 | `Lint` | Run Ruff and Python compilation checks. |
-| `SecretScan` | Scan the complete Git history with Gitleaks. Any detected secret fails the pipeline. |
+| `SecretScan` | Scan the complete Git history with Gitleaks. Any detected secret exits with code `1` and fails the pipeline. |
 | `SonarQube` | Run SonarQube source and dependency analysis and publish the quality gate. |
 | `BuildImage` | Build the commit-tagged Docker image once and export it as a pipeline artifact. |
-| `Trivy` | Scan the exact exported image. Unfixed HIGH or CRITICAL vulnerabilities fail the pipeline. |
+| `Trivy` | Scan the exact exported image for all vulnerabilities. Any vulnerability exits with code `1` and fails the pipeline. |
 | `Publish` | Push the scanned image to ACR from `main` only. |
 
-The image is tagged with both the commit SHA and `latest`. The same image artifact is built, scanned, and published; it is not rebuilt between security scanning and publishing.
+The image is tagged with both the commit SHA and `latest`. The same image artifact is built, scanned, and published; it is not rebuilt between security scanning and publishing. Gitleaks and Trivy are blocking gates, so the image cannot reach ACR when either scan finds a finding.
 
 ### Azure DevOps CI configuration
 
