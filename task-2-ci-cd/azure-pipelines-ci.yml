@@ -128,8 +128,8 @@ stages:
         steps:
           - checkout: self
           - bash: |
-              # Sign the exact tarball produced by BuildImage and scanned by Trivy.
-              # The private key stays in Azure DevOps secret variables.
+              # Scan the pinned Python dependency manifest with the secret Snyk token.
+              # Any reported vulnerability returns a nonzero exit code.
               set -euo pipefail
               docker run --rm \
                 -e SNYK_TOKEN \
@@ -196,8 +196,8 @@ stages:
               artifactName: db-health-check-image
               path: $(Pipeline.Workspace)/db-health-check-image
           - bash: |
-              # Fail CI if the signature does not match the image tarball.
-              # This is a detached artifact signature, not a registry signature.
+              # Load the exact image artifact exported by BuildImage.
+              # Any vulnerability returns a nonzero exit code.
               set -euo pipefail
               docker load --input "$(Pipeline.Workspace)/db-health-check-image/db-health-check.tar"
               docker run --rm \
