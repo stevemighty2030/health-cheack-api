@@ -1,0 +1,80 @@
+# Azure DevOps CI pipeline: pull-request validation and ACR image publishing.
+# Configure the Docker Registry service connection named "acr-service-connection".
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  pythonVersion: '3.12'
+  imageRepository: 'db-health-check'
+  acrLoginServer: '$(ACR_LOGIN_SERVER)'
+  dockerServiceConnection: 'acr-service-connection'
+
+stages:
+  - stage: Validate
+    displayName: Lint and test
+    jobs:
+      - job: Validate
+        displayName: Validate application
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - task: UsePythonVersion@0
+            displayName: Use Python $(pythonVersion)
+            inputs:
+              versionSpec: $(pythonVersion)
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+              pip install ruff
+              ruff check app verify_app.py
+              python -m compileall -q app verify_app.py
+              python verify_app.py
+            displayName: Install dependencies, lint, and smoke test
+
+          - task: Docker@2
+            displayName: Build image for validation
+            inputs:
+              command: build
+              repository: $(imageRepository)
+              Dockerfile: Dockerfile
+              tags: |
+                $(Build.SourceVersion)
+
+  - stage: Publish
+    displayName: Push image to ACR
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - job: Publish
+        displayName: Publish commit-tagged image
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+
+          - task: Docker@2
+            displayName: Build and push image
+            inputs:
+              command: buildAndPush
+              containerRegistry: $(dockerServiceConnection)
+              repository: $(imageRepository)
+              Dockerfile: Dockerfile
+              tags: |
+                $(Build.SourceVersion)
+                latest
+
+          - bash: |
+              echo "Published $(acrLoginServer)/$(imageRepository):$(Build.SourceVersion)"
+            displayName: Report published image

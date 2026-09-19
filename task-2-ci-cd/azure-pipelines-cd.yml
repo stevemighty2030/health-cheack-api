@@ -1,0 +1,91 @@
+# Azure DevOps CD pipeline: approval-gated GitOps promotion.
+# Create an Azure DevOps variable group named "db-health-check-cd" with:
+#   GITOPS_REPOSITORY: clone URL of the GitOps repository
+#   GITOPS_BRANCH: branch watched by Argo CD (default: main)
+#   GITOPS_TOKEN: secret PAT with permission to push that repository
+
+trigger: none
+pr: none
+
+resources:
+  pipelines:
+    - pipeline: ci
+      source: db-health-check-ci
+      trigger:
+        branches:
+          include:
+            - main
+
+variables:
+  - group: db-health-check-cd
+  - name: imageRepository
+    value: db-health-check
+  - name: gitOpsManifest
+    value: task-2-ci-cd/gitops/overlays/production/kustomization.yaml
+
+stages:
+  - stage: Approval
+    displayName: Approve production promotion
+    jobs:
+      - job: ManualApproval
+        displayName: Manual production approval
+        pool: server
+        timeoutInMinutes: 1440
+        steps:
+          - task: ManualValidation@1
+            timeoutInMinutes: 1440
+            inputs:
+              notifyUsers: '$(Build.RequestedForEmail)'
+              instructions: 'Review the CI run, image $(resources.pipeline.ci.runID), and production change. Resume to promote through GitOps.'
+              onTimeout: reject
+
+  - stage: Promote
+    displayName: Update GitOps repository
+    dependsOn: Approval
+    condition: succeeded()
+    jobs:
+      - job: UpdateGitOps
+        displayName: Commit approved image tag
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: none
+
+          - bash: |
+              set -euo pipefail
+              git -c http.extraheader="AUTHORIZATION: bearer ${GITOPS_TOKEN}" clone --branch "${GITOPS_BRANCH:-main}" "${GITOPS_REPOSITORY}" gitops-repo
+              cd gitops-repo
+              git config user.name "Azure DevOps"
+              git config user.email "azuredevops@local"
+
+              python - <<'PY'
+              from pathlib import Path
+              import os
+              import re
+
+              manifest = Path(os.environ['MANIFEST'])
+              contents = manifest.read_text()
+              replacement = rf'\1{os.environ["IMAGE"]}:\2{os.environ["IMAGE_TAG"]}'
+              updated, count = re.subn(
+                  r'(newName:\s*)[^\n]+(\n\s*newTag:\s*)[^\n]+',
+                  replacement,
+                  contents,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit(f'Expected one image tag in {manifest}, found {count}')
+              manifest.write_text(updated)
+              PY
+
+              git add "${MANIFEST}"
+              git diff --cached --quiet && echo "GitOps already uses ${IMAGE_TAG}" && exit 0
+              git commit -m "Promote ${IMAGE_TAG} to production [skip ci]"
+              git -c http.extraheader="AUTHORIZATION: bearer ${GITOPS_TOKEN}" push origin "${GITOPS_BRANCH:-main}"
+            displayName: Commit image tag to GitOps
+            env:
+              GITOPS_REPOSITORY: $(GITOPS_REPOSITORY)
+              GITOPS_BRANCH: $(GITOPS_BRANCH)
+              GITOPS_TOKEN: $(GITOPS_TOKEN)
+              MANIFEST: $(gitOpsManifest)
+              IMAGE: $(ACR_LOGIN_SERVER)/$(imageRepository)
+              IMAGE_TAG: $(resources.pipeline.ci.sourceCommit)
