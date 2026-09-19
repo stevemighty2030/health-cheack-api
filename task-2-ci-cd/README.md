@@ -3,8 +3,10 @@
 This folder contains separate Azure DevOps pipelines:
 
 - `azure-pipelines-ci.yml` validates pull requests, builds the Docker image, and pushes `$(ACR_LOGIN_SERVER)/db-health-check:<commit-sha>` to Azure Container Registry on `main`.
-- `azure-pipelines-cd.yml` is manual-trigger only and is started by a successful CI pipeline on `main`. It requires a production approval, then commits the approved image tag to the GitOps repository.
-- `gitops/` contains the Kubernetes manifests watched by Argo CD.
+- `azure-pipelines-cd.yml` is manual-trigger only and is started by a successful CI pipeline on `main`. It requires a production approval, then commits the approved image to the external GitOps repository.
+- `gitops/argocd/application.yaml` contains separate Argo CD Applications for dev, UAT, and production. Dev and UAT auto-sync; production requires a manual Argo CD sync.
+
+The external GitOps repository can use Helm charts or plain Kubernetes manifests.
 
 ## Azure DevOps setup
 
@@ -16,10 +18,20 @@ This folder contains separate Azure DevOps pipelines:
    - `GITOPS_REPOSITORY`: HTTPS clone URL for the GitOps repository.
    - `GITOPS_BRANCH`: branch Argo CD watches, normally `main`.
    - `GITOPS_TOKEN`: secret PAT with repository push permission.
+   - `GITOPS_UPDATE_MODE`: `helm-values` or `manifest`.
+   - `GITOPS_FILE`: path to the target environment file, for example `environments/prod/values.yaml` or `environments/prod/deployment.yaml`.
 6. Protect the production approval by configuring the Azure DevOps environment/checks as required by the organization.
 
 The CD pipeline also includes `ManualValidation@1`, so production promotion cannot continue until an operator resumes the run. The GitOps commit uses `[skip ci]` to avoid recursively rebuilding the image.
 
 ## Argo CD setup
 
-Apply `gitops/argocd/application.yaml` once to the Argo CD cluster after replacing the example repository URL and destination namespace. Argo CD then watches `gitops/overlays/production` and automatically syncs the image tag committed by the CD pipeline.
+Apply `gitops/argocd/application.yaml` once to the Argo CD cluster after replacing the example repository URL. The referenced external repository should contain these paths:
+
+```text
+environments/dev
+environments/uat
+environments/prod
+```
+
+Each environment path may contain a Helm chart or plain Kubernetes YAML. For Helm, the CD pipeline updates the first `repository:` and `tag:` fields in the configured values file. For plain manifests, it updates the first `image:` field in the configured YAML file.
