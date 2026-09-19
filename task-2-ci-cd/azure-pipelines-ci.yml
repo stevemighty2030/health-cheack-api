@@ -15,6 +15,7 @@ pr:
       - main
 
 variables:
+  # Pin tool versions so security results are reproducible between runs.
   pythonVersion: '3.12'
   imageRepository: 'db-health-check'
   acrLoginServer: '$(ACR_LOGIN_SERVER)'
@@ -25,6 +26,7 @@ variables:
   trivyVersion: '0.65.0'
 
 stages:
+  # Fast feedback gate for every pull request and main branch build.
   - stage: UnitTests
     displayName: Unit tests
     jobs:
@@ -44,6 +46,7 @@ stages:
               python -m pytest -q
             displayName: Install dependencies and run unit tests
 
+  # Keep formatting, static checks, and syntax errors out of later stages.
   - stage: Lint
     displayName: Lint and syntax check
     jobs:
@@ -64,6 +67,7 @@ stages:
               python -m compileall -q app tests verify_app.py
             displayName: Run lint and syntax checks
 
+  # Scan the complete Git history so secrets from older commits are also found.
   - stage: SecretScan
     displayName: Gitleaks secret scan
     jobs:
@@ -81,6 +85,7 @@ stages:
                 detect --source=/repo --no-banner --redact
             displayName: Run Gitleaks
 
+  # SonarQube evaluates source and dependency findings and publishes its gate.
   - stage: SonarQube
     displayName: SonarQube SCA analysis
     jobs:
@@ -109,6 +114,7 @@ stages:
             inputs:
               pollingTimeoutSec: '300'
 
+  # Build once after all quality gates and export the exact image for later jobs.
   - stage: BuildImage
     displayName: Build Docker image
     dependsOn:
@@ -142,6 +148,7 @@ stages:
               targetPath: $(Build.ArtifactStagingDirectory)/db-health-check.tar
               artifact: db-health-check-image
 
+  # Scan the exported image; do not rebuild so the scanned artifact is immutable.
   - stage: Trivy
     displayName: Trivy image security scan
     dependsOn: BuildImage
@@ -168,6 +175,7 @@ stages:
                 "$(imageRepository):$(Build.SourceVersion)"
             displayName: Run Trivy against build image
 
+  # Only main publishes the already-scanned image to ACR.
   - stage: Publish
     displayName: Push image to ACR
     dependsOn: Trivy

@@ -50,17 +50,32 @@ api:
 ci_cd:
   ci_pipeline:
     file: task-2-ci-cd/azure-pipelines-ci.yml
+    purpose: Validate source, scan for security issues, build one image, and publish only approved main-branch output.
     triggers:
       pull_requests: main
       pushes: main
     stages:
-      - UnitTests: Install dependencies and run pytest.
-      - Lint: Run Ruff and Python compilation checks.
-      - SecretScan: Scan repository history with Gitleaks.
-      - SonarQube: Run SonarQube SCA analysis and publish the quality gate.
-      - BuildImage: Build and export the commit-tagged Docker image.
-      - Trivy: Scan the exact built image for HIGH and CRITICAL vulnerabilities.
-      - Publish: Push the scanned image to ACR on successful builds from main.
+      - name: UnitTests
+        action: Install dependencies and run pytest.
+        blocks_on_failure: true
+      - name: Lint
+        action: Run Ruff and Python compilation checks.
+        blocks_on_failure: true
+      - name: SecretScan
+        action: Scan complete repository history with Gitleaks.
+        blocks_on_failure: true
+      - name: SonarQube
+        action: Run SonarQube source and dependency analysis and publish the quality gate.
+        blocks_on_failure: true
+      - name: BuildImage
+        action: Build the commit-tagged Docker image once and export it as a pipeline artifact.
+        blocks_on_failure: true
+      - name: Trivy
+        action: Scan the exact exported image for HIGH and CRITICAL vulnerabilities.
+        blocks_on_failure: true
+      - name: Publish
+        action: Push the scanned image to ACR on successful builds from main.
+        blocks_on_failure: true
     image_tags:
       - commit SHA
       - latest
@@ -68,6 +83,14 @@ ci_cd:
     required_variable: ACR_LOGIN_SERVER
     sonar_service_connection: sonarqube-service-connection
     required_sonar_variable: SONAR_PROJECT_KEY
+    security_thresholds:
+      gitleaks: Any detected secret fails the pipeline.
+      trivy: HIGH or CRITICAL unfixed image vulnerabilities fail the pipeline.
+      sonarqube: The configured SonarQube quality gate must pass.
+    image_integrity: BuildImage exports one image artifact; Trivy scans it and Publish pushes that same artifact.
+    required_extensions:
+      - Docker
+      - SonarQube
 
   cd_pipeline:
     file: task-2-ci-cd/azure-pipelines-cd.yml
