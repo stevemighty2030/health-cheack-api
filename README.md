@@ -23,7 +23,7 @@ A containerized FastAPI health-check service with PostgreSQL, Nginx, Azure DevOp
 - Azure DevOps project and agent pool
 - Azure Container Registry
 - Kubernetes cluster with Argo CD
-- Separate GitOps repository containing Helm charts or plain Kubernetes manifests
+- Separate GitOps repository containing Helm charts and environment-specific `values.yaml` files
 
 ## Local Setup
 
@@ -134,18 +134,24 @@ Create an Azure DevOps variable group named `db-health-check-cd`:
 | `GITOPS_REPOSITORY` | HTTPS clone URL of the external GitOps repository. |
 | `GITOPS_BRANCH` | Branch watched by Argo CD, normally `main`. |
 | `GITOPS_TOKEN` | Secret Azure DevOps PAT with repository push permission. |
-| `GITOPS_UPDATE_MODE` | `helm-values` or `manifest`. |
-| `GITOPS_FILE_DEV` | Path to the dev `values.yaml` or Kubernetes manifest. |
-| `GITOPS_FILE_UAT` | Path to the UAT `values.yaml` or Kubernetes manifest. |
-| `GITOPS_FILE_PROD` | Path to the production `values.yaml` or Kubernetes manifest. |
+| `GITOPS_VALUES_FILE_DEV` | Path to the dev Helm `values.yaml` file. |
+| `GITOPS_VALUES_FILE_UAT` | Path to the UAT Helm `values.yaml` file. |
+| `GITOPS_VALUES_FILE_PROD` | Path to the production Helm `values.yaml` file. |
 | `COSIGN_PUBLIC_KEY` | Public key used to verify the signature created by CI. |
 
-Update modes:
-
-- `helm-values`: updates the first `repository` and `tag` fields in the selected values file.
-- `manifest`: updates the first `image` field in the selected Kubernetes manifest.
+The CD pipeline updates only Helm `values.yaml` files. It changes the first `repository` and `tag` fields for deployments, or the `tag` field during rollback. Kubernetes manifests are rendered by the Helm chart and are not edited by this pipeline.
 
 The CD pipeline verifies the Cosign signature against the exact image tarball from the triggering CI run before changing GitOps. Missing artifacts or a mismatched signature fail CD. Dev and UAT are updated before the production approval gate. The GitOps commit uses `[skip ci]` to prevent a recursive image build.
+
+### Rollback
+
+Run the CD pipeline manually with:
+
+- `rollback`: `true`
+- `rollbackEnvironment`: `dev`, `uat`, or `prod`
+- `previousImageTag`: the previously deployed, known-good commit SHA tag stored in ACR
+
+Rollback mode skips normal promotion and updates only the selected Helm `values.yaml` file with the supplied previous image tag. It commits the change with `[skip ci]`, after which Argo CD redeploys that image. Production still requires the manual Argo CD sync configured for the production Application.
 
 ## Argo CD GitOps
 
@@ -165,7 +171,7 @@ environments/prod
 | UAT | `db-health-check-uat` | Automated sync, self-heal, and prune. |
 | Production | `db-health-check-prod` | No automated sync. An operator manually reviews and syncs the approved change. |
 
-Each environment may contain a Helm chart or plain Kubernetes manifests. Kustomize is not required.
+Each environment is a Helm chart or Helm chart values path monitored by Argo CD. The CD pipeline edits only the configured `values.yaml` files.
 
 ## Repository Structure
 
