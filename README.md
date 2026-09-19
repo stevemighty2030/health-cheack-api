@@ -1,6 +1,6 @@
 # FastAPI Health Check App
 
-A containerized FastAPI health-check service with PostgreSQL, Nginx, Azure DevOps CI/CD, Azure Container Registry, and Argo CD GitOps deployment.
+A containerized FastAPI health-check service with PostgreSQL, Nginx, Azure DevOps CI/CD, Azure Container Registry, Argo CD GitOps, and Terraform infrastructure.
 
 ## Features
 
@@ -8,53 +8,37 @@ A containerized FastAPI health-check service with PostgreSQL, Nginx, Azure DevOp
 - PostgreSQL database health check
 - Nginx reverse proxy
 - Docker Compose local development
-- Azure DevOps CI with testing, linting, secret scanning, SCA, SAST, and image publishing
-- Argo CD deployment to dev, UAT, and production
- Terraform infrastructure for the network, AKS, PostgreSQL, ACR, Key Vault, and RBAC
+- Azure DevOps CI with tests, linting, Gitleaks, SonarQube, Snyk, Trivy, and Cosign
+- Helm values promotion through Argo CD for dev, UAT, and production
+- Terraform infrastructure for Azure networking, AKS, ACR, PostgreSQL, Key Vault, and RBAC
 
- Task 3 is in [task-3-infrastructure](task-3-infrastructure/). The Terraform configuration defines:
+## Requirements
 
 ### Local development
-### Security design
 
-- No password is hardcoded in Terraform. `postgres_admin_password` is sensitive and is stored in Key Vault.
-- The AKS kubelet identity receives only `AcrPull` on this ACR.
-- The Key Vault Secrets Provider identity receives only read access to Key Vault secrets.
-- PostgreSQL has public network access disabled and runs in the private database subnet.
-- The public subnet allows only TCP 443 through its network security group.
-- AKS uses Azure RBAC, workload identity, and the Key Vault Secrets Provider.
-
-### Deployment review
-
-Terraform can be reviewed without an Azure account. Initialize and validate without a backend:
-
-```bash
-terraform -chdir=task-3-infrastructure init -backend=false
-terraform -chdir=task-3-infrastructure validate
-```
-
-Copy `task-3-infrastructure/terraform.tfvars.example` to a local ignored `.tfvars` file, replace the resource group and subscription values, and provide the PostgreSQL password through a secure variable. Never commit the real password.
 - Docker and Docker Compose
- │   ├── main.tf
- │   ├── variables.tf
- │   ├── versions.tf
- │   ├── outputs.tf
- │   └── terraform.tfvars.example
+- Python 3.12 or newer for local validation
 
 ### CI/CD and deployment
 
 - Azure DevOps project and agent pool
 - Azure Container Registry
 - Kubernetes cluster with Argo CD
-- Separate GitOps repository containing Helm charts and environment-specific `values.yaml` files
+- External GitOps repository containing Helm charts and environment-specific `values.yaml` files
 
-## Local Setup
+## Run Locally With Docker Compose
 
-Copy the example environment file and start the stack:
+Create the local environment file and start the complete stack:
 
 ```bash
 cp .env.example .env
 docker compose up --build
+```
+
+Stop the stack with:
+
+```bash
+docker compose down
 ```
 
 Services:
@@ -66,7 +50,7 @@ Services:
 | Nginx | http://localhost |
 | PostgreSQL | localhost:5432 |
 
-### Environment variables
+The application uses these local environment variables:
 
 ```env
 DATABASE_URL=postgresql+asyncpg://appuser:secret@db:5432/healthdb
@@ -89,8 +73,6 @@ Do not commit real secrets. Use Azure Key Vault or another secure secret store i
 
 ### `GET /health`
 
-Returns the application and database status:
-
 ```json
 {
   "status": "ok",
@@ -98,134 +80,151 @@ Returns the application and database status:
 }
 ```
 
-## CI Pipeline
+The health endpoint returns `degraded` when no database URL is configured and `unhealthy` when the database cannot be reached.
 
-Pipeline file: [task-2-ci-cd/azure-pipelines-ci.yml](task-2-ci-cd/azure-pipelines-ci.yml)
+## CI/CD Pipeline Stages
 
-The pipeline runs for pull requests and pushes to `main`:
+CI pipeline: [task-2-ci-cd/azure-pipelines-ci.yml](task-2-ci-cd/azure-pipelines-ci.yml)
 
-| Stage | Purpose |
-| --- | --- |
-| `UnitTests` | Install dependencies and run `pytest`. |
-| `Lint` | Run Ruff and Python compilation checks. |
-| `SecretScan` | Scan the complete Git history with Gitleaks. Any detected secret exits with code `1` and fails the pipeline. |
-| `SonarQube` | Run SonarQube source and dependency analysis and publish the quality gate. |
-| `SAST` | Use Snyk to scan `requirements.txt` for third-party dependency vulnerabilities at all severity levels. Any finding fails the pipeline. |
-| `BuildImage` | Build the commit-tagged Docker image once and export it as a pipeline artifact. |
-| `Trivy` | Scan the exact exported image for all vulnerabilities. Any vulnerability exits with code `1` and fails the pipeline. |
-| `SignImage` | Sign and verify the exact exported image artifact with Cosign before publishing. |
-| `Publish` | Push the scanned image to ACR from `main` only. |
+The CI pipeline runs for pull requests and pushes to `main`:
 
-The image is tagged with both the commit SHA and `latest`. The same image artifact is built, scanned, signed, and published; it is not rebuilt between security scanning and publishing. Gitleaks and Trivy are blocking gates, so the image cannot reach ACR when either scan finds a finding.
+| Stage | What it does | Failure behavior |
+| --- | --- | --- |
+| `UnitTests` | Installs dependencies and runs `pytest`. | Test failure stops the pipeline. |
+| `Lint` | Runs Ruff and Python compilation checks. | Any lint or syntax failure stops the pipeline. |
+| `SecretScan` | Scans the complete Git history with Gitleaks. | Any detected secret exits with code `1`. |
+| `SonarQube` | Runs source and dependency analysis and publishes the quality gate. | A failed quality gate stops the pipeline. |
+| `SAST` | Uses Snyk to scan third-party Python dependencies in `requirements.txt`. | Any dependency vulnerability exits nonzero. |
+| `BuildImage` | Builds the image once and exports it as a pipeline artifact. | Build or artifact failure stops the pipeline. |
+| `Trivy` | Scans the exact exported image for vulnerabilities. | Any vulnerability exits with code `1`. |
+| `SignImage` | Signs and verifies the exact image artifact with Cosign. | A missing or invalid signature stops the pipeline. |
+| `Publish` | Pushes the scanned and signed image to ACR from `main`. | Publish runs only after every previous stage succeeds. |
 
-### Azure DevOps CI configuration
+The image is tagged with its commit SHA and `latest`. The same image artifact is built, scanned, signed, and published; it is not rebuilt between security scanning and publishing.
 
-Create these service connections and variables:
+Required Azure DevOps configuration:
 
 - Docker Registry service connection: `acr-service-connection`
 - SonarQube service connection: `sonarqube-service-connection`
-- Pipeline variable: `ACR_LOGIN_SERVER`, such as `myregistry.azurecr.io`
+- Pipeline variable: `ACR_LOGIN_SERVER`
 - Pipeline variable: `SONAR_PROJECT_KEY`
-- Secret pipeline variable: `SNYK_TOKEN`
-- Secret pipeline variables: `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD`, and `COSIGN_PUBLIC_KEY`
+- Secret variable: `SNYK_TOKEN`
+- Secret variables: `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD`, and `COSIGN_PUBLIC_KEY`
 
-Install the Azure DevOps `Docker` and `SonarQube` extensions. Review the Gitleaks, Snyk, Trivy, and Cosign versions before production use. The Snyk `SAST` stage runs before `BuildImage`, and its nonzero exit code prevents both image construction and ACR publishing when a third-party dependency vulnerability is found. The `SignImage` stage signs and verifies the same image artifact that `Publish` later pushes to ACR.
+## CD Promotion Stages
 
-Cosign uses `sign-blob` and `verify-blob` for the exported image tarball. The detached signature is published as a pipeline artifact, and CD verifies it again with `COSIGN_PUBLIC_KEY` before any GitOps update. This protects the CI artifact handoff; it is separate from registry-based Cosign signing and verification by image digest.
+CD pipeline: [task-2-ci-cd/azure-pipelines-cd.yml](task-2-ci-cd/azure-pipelines-cd.yml)
 
-## CD Pipeline
-
-Pipeline file: [task-2-ci-cd/azure-pipelines-cd.yml](task-2-ci-cd/azure-pipelines-cd.yml)
-
-The CD pipeline starts after a successful `db-health-check-ci` run on `main`:
+The CD pipeline is triggered by a successful CI run on `main`:
 
 ```text
 VerifyImage -> DeployDev -> DeployUat -> Approval -> DeployProd
 ```
 
-1. Download the image and Cosign signature from the exact CI run.
-2. Verify that the signature matches the image artifact.
-3. Update and commit the dev GitOps file. Argo CD auto-syncs dev.
-4. Update and commit the UAT GitOps file. Argo CD auto-syncs UAT.
-5. Wait for manual production approval.
-6. Update and commit the production GitOps file. Production requires a manual Argo CD sync.
+- `VerifyImage` downloads the exact CI image and Cosign signature artifacts and verifies that the signature matches the image.
+- `DeployDev` updates only the dev Helm `values.yaml`; Argo CD auto-syncs dev.
+- `DeployUat` updates only the UAT Helm `values.yaml`; Argo CD auto-syncs UAT.
+- `Approval` pauses for manual production approval.
+- `DeployProd` updates only the production Helm `values.yaml`; production Argo CD auto-sync remains disabled and requires manual sync.
 
-Create an Azure DevOps variable group named `db-health-check-cd`:
+Create the Azure DevOps variable group `db-health-check-cd`:
 
-| Variable | Description |
+| Variable | Purpose |
 | --- | --- |
 | `GITOPS_REPOSITORY` | HTTPS clone URL of the external GitOps repository. |
-| `GITOPS_BRANCH` | Branch watched by Argo CD, normally `main`. |
-| `GITOPS_TOKEN` | Secret Azure DevOps PAT with repository push permission. |
-| `GITOPS_VALUES_FILE_DEV` | Path to the dev Helm `values.yaml` file. |
-| `GITOPS_VALUES_FILE_UAT` | Path to the UAT Helm `values.yaml` file. |
-| `GITOPS_VALUES_FILE_PROD` | Path to the production Helm `values.yaml` file. |
-| `COSIGN_PUBLIC_KEY` | Public key used to verify the signature created by CI. |
-
-The CD pipeline updates only Helm `values.yaml` files. It changes the first `repository` and `tag` fields for deployments, or the `tag` field during rollback. Kubernetes manifests are rendered by the Helm chart and are not edited by this pipeline.
-
-The CD pipeline verifies the Cosign signature against the exact image tarball from the triggering CI run before changing GitOps. Missing artifacts or a mismatched signature fail CD. Dev and UAT are updated before the production approval gate. The GitOps commit uses `[skip ci]` to prevent a recursive image build.
+| `GITOPS_BRANCH` | Branch monitored by Argo CD, normally `main`. |
+| `GITOPS_TOKEN` | Secret PAT with permission to push the GitOps repository. |
+| `GITOPS_VALUES_FILE_DEV` | Dev Helm `values.yaml` path. |
+| `GITOPS_VALUES_FILE_UAT` | UAT Helm `values.yaml` path. |
+| `GITOPS_VALUES_FILE_PROD` | Production Helm `values.yaml` path. |
+| `COSIGN_PUBLIC_KEY` | Public key matching the CI signing key. |
 
 ### Rollback
 
-Run the CD pipeline manually with:
-
-- `rollback`: `true`
-- `rollbackEnvironment`: `dev`, `uat`, or `prod`
-- `previousImageTag`: the previously deployed, known-good commit SHA tag stored in ACR
-
-Rollback mode skips normal promotion and updates only the selected Helm `values.yaml` file with the supplied previous image tag. It commits the change with `[skip ci]`, after which Argo CD redeploys that image. Production still requires the manual Argo CD sync configured for the production Application.
+Run CD manually with `rollback: true`, select `rollbackEnvironment` as `dev`, `uat`, or `prod`, and provide `previousImageTag` as the previously deployed, known-good commit SHA stored in ACR. Rollback updates only the selected Helm `values.yaml` tag and commits with `[skip ci]`. Argo CD redeploys the previous image; production still requires manual Argo CD sync.
 
 ## Argo CD GitOps
 
-Application definitions: [task-2-ci-cd/gitops/argocd/application.yaml](task-2-ci-cd/gitops/argocd/application.yaml)
+Argo CD definitions: [task-2-ci-cd/gitops/argocd/application.yaml](task-2-ci-cd/gitops/argocd/application.yaml)
 
-Replace the example Azure DevOps URL in that file with the external GitOps repository. The repository should expose these paths:
+The external GitOps repository is expected to contain:
 
 ```text
-environments/dev
-environments/uat
-environments/prod
+environments/dev/<helm-chart>/values.yaml
+environments/uat/<helm-chart>/values.yaml
+environments/prod/<helm-chart>/values.yaml
 ```
 
-| Environment | Namespace | Sync behavior |
-| --- | --- | --- |
-| Dev | `db-health-check-dev` | Automated sync, self-heal, and prune. |
-| UAT | `db-health-check-uat` | Automated sync, self-heal, and prune. |
-| Production | `db-health-check-prod` | No automated sync. An operator manually reviews and syncs the approved change. |
+| Environment | Sync behavior |
+| --- | --- |
+| Dev | Automated sync, self-heal, and prune. |
+| UAT | Automated sync, self-heal, and prune. |
+| Production | No automated sync; an operator reviews and manually syncs. |
 
-Each environment is a Helm chart or Helm chart values path monitored by Argo CD. The CD pipeline edits only the configured `values.yaml` files.
+The CD pipeline edits only Helm `values.yaml` files. Kubernetes manifests are rendered by the Helm chart and are not edited by CD.
 
 ## Infrastructure as Code
 
-Task 3 is in [task-3-infrastructure](task-3-infrastructure/). The Terraform configuration defines:
+Task 3 Terraform is in [task-3-infrastructure](task-3-infrastructure/):
 
-- Public, AKS, and private database subnets in one virtual network.
-- AKS compute for running the container.
-- Private Azure Database for PostgreSQL Flexible Server.
-- ACR with the AKS kubelet limited to the `AcrPull` role.
-- Key Vault with RBAC and secure PostgreSQL secret storage.
-- AKS workload identity, Key Vault Secrets Provider, monitoring, and least-privilege access.
+- `main.tf`: VNet, public/AKS/private subnets, NSGs, AKS, ACR, PostgreSQL, Key Vault, monitoring, and RBAC.
+- `variables.tf`: typed infrastructure inputs, including the sensitive database password.
+- `versions.tf`: Terraform and AzureRM provider requirements.
+- `outputs.tf`: ACR, AKS, PostgreSQL, and Key Vault outputs.
+- `terraform.tfvars.example`: non-secret example values.
 
-### Security design
-
-- No password is hardcoded in Terraform. `postgres_admin_password` is sensitive and is stored in Key Vault.
-- The AKS kubelet identity receives only `AcrPull` on this ACR.
-- The Key Vault Secrets Provider identity receives only read access to Key Vault secrets.
-- PostgreSQL has public network access disabled and runs in the private database subnet.
-- The public subnet allows only TCP 443 through its network security group.
-- AKS uses Azure RBAC, workload identity, and the Key Vault Secrets Provider.
-
-### Deployment review
-
-Terraform can be reviewed without an Azure account. Initialize and validate without a backend:
+Validate without an Azure deployment:
 
 ```bash
 terraform -chdir=task-3-infrastructure init -backend=false
 terraform -chdir=task-3-infrastructure validate
 ```
 
-Copy `task-3-infrastructure/terraform.tfvars.example` to a local ignored `.tfvars` file, replace the resource group and subscription values, and provide the PostgreSQL password through a secure variable. Never commit the real password.
+The PostgreSQL password must be supplied through a secure variable or ignored `.tfvars` file. Never commit the real password.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Developer[Developer] --> Compose[Docker Compose]
+    Compose --> Nginx[Nginx]
+    Nginx --> App[FastAPI app]
+    App --> LocalDB[(PostgreSQL local)]
+
+    Developer --> PR[Pull request or main push]
+    PR --> CI[Azure DevOps CI]
+    CI --> Gates[Tests, lint, Gitleaks, SonarQube, Snyk, Trivy, Cosign]
+    Gates --> ACR[Azure Container Registry]
+    CI --> CD[Azure DevOps CD]
+    CD --> GitOps[External GitOps repo Helm values.yaml]
+    GitOps --> Argo[Argo CD]
+    Argo --> Dev[AKS dev]
+    Argo --> UAT[AKS UAT]
+    Argo --> Prod[AKS production manual sync]
+
+    TF[Terraform] --> VNet[Azure VNet public, AKS, private subnets]
+    TF --> AKS[AKS cluster]
+    TF --> ACR
+    TF --> PG[(Private PostgreSQL Flexible Server)]
+    TF --> KV[Azure Key Vault]
+    AKS --> ACR
+    AKS --> KV
+    AKS --> PG
+```
+
+## Assumptions And Future Improvement
+
+### Assumptions
+
+- The external GitOps repository already contains compatible Helm charts and separate values files for dev, UAT, and production.
+- Azure DevOps service connections, variable groups, approvals, SonarQube, Snyk, and signing keys are configured outside this repository.
+- Argo CD is already installed in the target Kubernetes cluster and has access to the GitOps repository.
+- The Terraform deployment targets an existing Azure resource group.
+
+
+### One improvement with more time
+
+I would replace detached Cosign tarball signatures with registry-based Cosign signatures bound to the immutable ACR image digest, then enforce signature verification with an admission policy in AKS. That would verify the exact image pulled by the cluster rather than only the CI artifact handoff.
 
 ## Repository Structure
 
@@ -241,11 +240,6 @@ Copy `task-3-infrastructure/terraform.tfvars.example` to a local ignored `.tfvar
 │   ├── azure-pipelines-cd.yml
 │   └── gitops/argocd/application.yaml
 ├── task-3-infrastructure/
-│   ├── main.tf
-│   ├── variables.tf
-│   ├── versions.tf
-│   ├── outputs.tf
-│   ├── terraform.tfvars.example
 │   ├── main.tf
 │   ├── variables.tf
 │   ├── versions.tf
