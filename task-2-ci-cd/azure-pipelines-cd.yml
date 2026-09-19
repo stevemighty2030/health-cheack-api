@@ -3,6 +3,8 @@
 #   GITOPS_REPOSITORY: clone URL of the GitOps repository
 #   GITOPS_BRANCH: branch watched by Argo CD (default: main)
 #   GITOPS_TOKEN: secret PAT with permission to push that repository
+#   GITOPS_UPDATE_MODE: helm-values or manifest
+#   GITOPS_FILE: path in the GitOps repository to the values or manifest file
 
 trigger: none
 pr: none
@@ -20,8 +22,6 @@ variables:
   - group: db-health-check-cd
   - name: imageRepository
     value: db-health-check
-  - name: gitOpsManifest
-    value: task-2-ci-cd/gitops/overlays/production/kustomization.yaml
 
 stages:
   - stage: Approval
@@ -53,7 +53,8 @@ stages:
 
           - bash: |
               set -euo pipefail
-              git -c http.extraheader="AUTHORIZATION: bearer ${GITOPS_TOKEN}" clone --branch "${GITOPS_BRANCH:-main}" "${GITOPS_REPOSITORY}" gitops-repo
+              auth_header=$(printf ':%s' "${GITOPS_TOKEN}" | base64 -w 0)
+              git -c http.extraheader="AUTHORIZATION: Basic ${auth_header}" clone --branch "${GITOPS_BRANCH:-main}" "${GITOPS_REPOSITORY}" gitops-repo
               cd gitops-repo
               git config user.name "Azure DevOps"
               git config user.email "azuredevops@local"
@@ -63,29 +64,51 @@ stages:
               import os
               import re
 
-              manifest = Path(os.environ['MANIFEST'])
-              contents = manifest.read_text()
-              replacement = rf'\1{os.environ["IMAGE"]}:\2{os.environ["IMAGE_TAG"]}'
-              updated, count = re.subn(
-                  r'(newName:\s*)[^\n]+(\n\s*newTag:\s*)[^\n]+',
-                  replacement,
-                  contents,
-                  count=1,
-              )
-              if count != 1:
-                  raise SystemExit(f'Expected one image tag in {manifest}, found {count}')
-              manifest.write_text(updated)
+              file_path = Path(os.environ['GITOPS_FILE'])
+              contents = file_path.read_text()
+              image = os.environ['IMAGE']
+              tag = os.environ['IMAGE_TAG']
+
+              if os.environ['GITOPS_UPDATE_MODE'] == 'helm-values':
+                  updated, repository_count = re.subn(
+                      r'(?m)^(\s*repository:\s*).+$',
+                      rf'\g<1>{image}',
+                      contents,
+                      count=1,
+                  )
+                  updated, tag_count = re.subn(
+                      r'(?m)^(\s*tag:\s*).+$',
+                      rf'\g<1>{tag}',
+                      updated,
+                      count=1,
+                  )
+                  count = repository_count + tag_count
+              elif os.environ['GITOPS_UPDATE_MODE'] == 'manifest':
+                  updated, count = re.subn(
+                      r'(?m)^(\s*image:\s*).+$',
+                      rf'\g<1>{image}:{tag}',
+                      contents,
+                      count=1,
+                  )
+              else:
+                  raise SystemExit('GITOPS_UPDATE_MODE must be helm-values or manifest')
+
+              expected = 2 if os.environ['GITOPS_UPDATE_MODE'] == 'helm-values' else 1
+              if count != expected:
+                  raise SystemExit(f'Expected {expected} image fields in {file_path}, found {count}')
+              file_path.write_text(updated)
               PY
 
-              git add "${MANIFEST}"
+              git add "${GITOPS_FILE}"
               git diff --cached --quiet && echo "GitOps already uses ${IMAGE_TAG}" && exit 0
               git commit -m "Promote ${IMAGE_TAG} to production [skip ci]"
-              git -c http.extraheader="AUTHORIZATION: bearer ${GITOPS_TOKEN}" push origin "${GITOPS_BRANCH:-main}"
+              git -c http.extraheader="AUTHORIZATION: Basic ${auth_header}" push origin "${GITOPS_BRANCH:-main}"
             displayName: Commit image tag to GitOps
             env:
               GITOPS_REPOSITORY: $(GITOPS_REPOSITORY)
               GITOPS_BRANCH: $(GITOPS_BRANCH)
               GITOPS_TOKEN: $(GITOPS_TOKEN)
-              MANIFEST: $(gitOpsManifest)
+              GITOPS_UPDATE_MODE: $(GITOPS_UPDATE_MODE)
+              GITOPS_FILE: $(GITOPS_FILE)
               IMAGE: $(ACR_LOGIN_SERVER)/$(imageRepository)
               IMAGE_TAG: $(resources.pipeline.ci.sourceCommit)
