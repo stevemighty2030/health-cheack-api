@@ -87,6 +87,7 @@ The pipeline runs for pull requests and pushes to `main`:
 | `Lint` | Run Ruff and Python compilation checks. |
 | `SecretScan` | Scan the complete Git history with Gitleaks. Any detected secret exits with code `1` and fails the pipeline. |
 | `SonarQube` | Run SonarQube source and dependency analysis and publish the quality gate. |
+| `SAST` | Use Snyk to scan `requirements.txt` for third-party dependency vulnerabilities at all severity levels. Any finding fails the pipeline. |
 | `BuildImage` | Build the commit-tagged Docker image once and export it as a pipeline artifact. |
 | `Trivy` | Scan the exact exported image for all vulnerabilities. Any vulnerability exits with code `1` and fails the pipeline. |
 | `Publish` | Push the scanned image to ACR from `main` only. |
@@ -101,8 +102,9 @@ Create these service connections and variables:
 - SonarQube service connection: `sonarqube-service-connection`
 - Pipeline variable: `ACR_LOGIN_SERVER`, such as `myregistry.azurecr.io`
 - Pipeline variable: `SONAR_PROJECT_KEY`
+- Secret pipeline variable: `SNYK_TOKEN`
 
-Install the Azure DevOps `Docker` and `SonarQube` extensions. Pin or review the Gitleaks and Trivy versions in the pipeline before production use.
+Install the Azure DevOps `Docker` and `SonarQube` extensions. Review the Gitleaks, Snyk, and Trivy scanner versions before production use. The Snyk `SAST` stage runs before `BuildImage`, and its nonzero exit code prevents both image construction and ACR publishing when a third-party dependency vulnerability is found.
 
 ## CD Pipeline
 

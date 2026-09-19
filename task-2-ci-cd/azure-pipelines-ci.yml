@@ -2,6 +2,7 @@
 # Required setup:
 #   - Docker Registry service connection: acr-service-connection
 #   - SonarQube service connection: sonarqube-service-connection
+#   - Secret pipeline variable: SNYK_TOKEN
 #   - Pipeline variables: ACR_LOGIN_SERVER and SONAR_PROJECT_KEY
 
 trigger:
@@ -114,6 +115,31 @@ stages:
             inputs:
               pollingTimeoutSec: '300'
 
+  # Snyk performs the requested SAST dependency gate before any image is built.
+  # Snyk exits with code 1 when it finds a vulnerability at any severity.
+  - stage: SAST
+    displayName: Snyk SAST third-party dependency scan
+    jobs:
+      - job: Snyk
+        displayName: Scan Python dependencies with Snyk
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - bash: |
+              set -euo pipefail
+              docker run --rm \
+                -e SNYK_TOKEN \
+                -v "$(Build.SourcesDirectory):/project" \
+                snyk/snyk:python \
+                test --file=/project/requirements.txt \
+                --package-manager=pip \
+                --severity-threshold=low \
+                --fail-on=all
+            displayName: Fail on any third-party dependency vulnerability
+            env:
+              SNYK_TOKEN: $(SNYK_TOKEN)
+
   # Build once after all quality gates and export the exact image for later jobs.
   - stage: BuildImage
     displayName: Build Docker image
@@ -122,6 +148,7 @@ stages:
       - Lint
       - SecretScan
       - SonarQube
+      - SAST
     condition: succeeded()
     jobs:
       - job: BuildImage
