@@ -1,0 +1,134 @@
+project:
+  name: db-health-check
+  description: Minimal FastAPI health-check service with PostgreSQL, Nginx, Azure DevOps CI/CD, ACR, and Argo CD GitOps.
+
+features:
+  - FastAPI endpoints at / and /health
+  - PostgreSQL database health check
+  - Nginx reverse proxy
+  - Docker Compose local development
+  - Azure DevOps continuous integration and delivery
+  - Azure Container Registry image storage
+  - Argo CD GitOps deployment for dev, UAT, and production
+
+requirements:
+  - Docker and Docker Compose
+  - Python 3.12 or newer for local validation
+  - Azure DevOps project and agent pool
+  - Azure Container Registry
+  - Kubernetes cluster with Argo CD
+  - Separate GitOps repository containing Helm charts or Kubernetes manifests
+
+local_setup:
+  environment_file: cp .env.example .env
+  start_command: docker compose up --build
+  services:
+    app: http://localhost:8000
+    health_check: http://localhost:8000/health
+    nginx: http://localhost
+    postgres: localhost:5432
+  environment_variables:
+    DATABASE_URL: postgresql+asyncpg://appuser:secret@db:5432/healthdb
+    POSTGRES_DB: healthdb
+    POSTGRES_USER: appuser
+    POSTGRES_PASSWORD: secret
+  security_note: Do not commit real secrets. Use Azure or another secure secret store in production.
+
+api:
+  root:
+    method: GET
+    path: /
+    response:
+      message: FastAPI service is running
+  health:
+    method: GET
+    path: /health
+    response:
+      status: ok
+      database: connected
+
+ci_cd:
+  ci_pipeline:
+    file: task-2-ci-cd/azure-pipelines-ci.yml
+    triggers:
+      pull_requests: main
+      pushes: main
+    stages:
+      - UnitTests: Install dependencies and run pytest.
+      - Lint: Run Ruff and Python compilation checks.
+      - SecretScan: Scan repository history with Gitleaks.
+      - SonarQube: Run SonarQube SCA analysis and publish the quality gate.
+      - BuildImage: Build and export the commit-tagged Docker image.
+      - Trivy: Scan the exact built image for HIGH and CRITICAL vulnerabilities.
+      - Publish: Push the scanned image to ACR on successful builds from main.
+    image_tags:
+      - commit SHA
+      - latest
+    service_connection: acr-service-connection
+    required_variable: ACR_LOGIN_SERVER
+    sonar_service_connection: sonarqube-service-connection
+    required_sonar_variable: SONAR_PROJECT_KEY
+
+  cd_pipeline:
+    file: task-2-ci-cd/azure-pipelines-cd.yml
+    trigger: Successful db-health-check-ci pipeline on main
+    stages:
+      - Manual production approval
+      - Update the external GitOps repository with the newly built ACR image
+      - Commit and push the GitOps change
+    required_variable_group: db-health-check-cd
+    required_variables:
+      GITOPS_REPOSITORY: HTTPS clone URL of the external GitOps repository
+      GITOPS_BRANCH: Branch watched by Argo CD, normally main
+      GITOPS_TOKEN: Secret Azure DevOps PAT with repository push permission
+      GITOPS_UPDATE_MODE: helm-values or manifest
+      GITOPS_FILE: Path to the target values.yaml or Kubernetes manifest
+    update_modes:
+      helm-values: Updates the first image repository and tag fields in the configured values file.
+      manifest: Updates the first image field in the configured Kubernetes manifest.
+    safeguards:
+      - Production approval is required before the GitOps update.
+      - GitOps commits use [skip ci] to prevent recursive image builds.
+      - The GitOps token is passed through a secret variable.
+
+argocd:
+  application_file: task-2-ci-cd/gitops/argocd/application.yaml
+  repository_url: Replace the example Azure DevOps URL with the external GitOps repository.
+  environments:
+    dev:
+      path: environments/dev
+      namespace: db-health-check-dev
+      automated_sync: true
+      self_heal: true
+      prune: true
+    uat:
+      path: environments/uat
+      namespace: db-health-check-uat
+      automated_sync: true
+      self_heal: true
+      prune: true
+    prod:
+      path: environments/prod
+      namespace: db-health-check-prod
+      automated_sync: false
+      sync_process: Operator reviews and manually syncs the approved GitOps change.
+  external_repository_layout:
+    - environments/dev
+    - environments/uat
+    - environments/prod
+  deployment_formats:
+    - Helm chart
+    - Plain Kubernetes manifests
+
+repository_structure:
+  - app/main.py
+  - Dockerfile
+  - docker-compose.yml
+  - nginx.conf
+  - requirements.txt
+  - verify_app.py
+  - task-2-ci-cd/azure-pipelines-ci.yml
+  - task-2-ci-cd/azure-pipelines-cd.yml
+  - task-2-ci-cd/gitops/argocd/application.yaml
+  - README.md
+  - readme.yaml

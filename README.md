@@ -99,3 +99,7 @@ Example response:
 - The app is intentionally simple and meant to be a base for containerization and infrastructure planning.
 - A multi-stage Docker build is used to keep the final image smaller.
 - Nginx is configured as a reverse proxy to the FastAPI container.
+
+## CI/CD and Deployment Reference
+
+The complete project, Azure DevOps CI/CD, ACR, and Argo CD configuration is documented in [`readme.yaml`](readme.yaml). The pipeline files are under `task-2-ci-cd/`.

@@ -1,5 +1,8 @@
-# Azure DevOps CI pipeline: pull-request validation and ACR image publishing.
-# Configure the Docker Registry service connection named "acr-service-connection".
+# Azure DevOps CI pipeline: test, lint, scan, build, and publish.
+# Required setup:
+#   - Docker Registry service connection: acr-service-connection
+#   - SonarQube service connection: sonarqube-service-connection
+#   - Pipeline variables: ACR_LOGIN_SERVER and SONAR_PROJECT_KEY
 
 trigger:
   branches:
@@ -16,45 +19,158 @@ variables:
   imageRepository: 'db-health-check'
   acrLoginServer: '$(ACR_LOGIN_SERVER)'
   dockerServiceConnection: 'acr-service-connection'
+  sonarQubeServiceConnection: 'sonarqube-service-connection'
+  sonarProjectKey: '$(SONAR_PROJECT_KEY)'
+  gitleaksVersion: '8.28.0'
+  trivyVersion: '0.65.0'
 
 stages:
-  - stage: Validate
-    displayName: Lint and test
+  - stage: UnitTests
+    displayName: Unit tests
     jobs:
-      - job: Validate
-        displayName: Validate application
+      - job: UnitTests
+        displayName: Run Python unit tests
         pool:
           vmImage: ubuntu-latest
         steps:
           - checkout: self
-            fetchDepth: 1
-
           - task: UsePythonVersion@0
             displayName: Use Python $(pythonVersion)
             inputs:
               versionSpec: $(pythonVersion)
-
           - script: |
               python -m pip install --upgrade pip
-              pip install -r requirements.txt
-              pip install ruff
-              ruff check app verify_app.py
-              python -m compileall -q app verify_app.py
-              python verify_app.py
-            displayName: Install dependencies, lint, and smoke test
+              pip install -r requirements.txt pytest
+              python -m pytest -q
+            displayName: Install dependencies and run unit tests
 
+  - stage: Lint
+    displayName: Lint and syntax check
+    jobs:
+      - job: Lint
+        displayName: Run Ruff and compile checks
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - task: UsePythonVersion@0
+            displayName: Use Python $(pythonVersion)
+            inputs:
+              versionSpec: $(pythonVersion)
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt ruff
+              ruff check app tests verify_app.py
+              python -m compileall -q app tests verify_app.py
+            displayName: Run lint and syntax checks
+
+  - stage: SecretScan
+    displayName: Gitleaks secret scan
+    jobs:
+      - job: Gitleaks
+        displayName: Scan repository history for secrets
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+            fetchDepth: 0
+          - bash: |
+              docker run --rm \
+                -v "$(Build.SourcesDirectory):/repo" \
+                zricethezav/gitleaks:v$(gitleaksVersion) \
+                detect --source=/repo --no-banner --redact
+            displayName: Run Gitleaks
+
+  - stage: SonarQube
+    displayName: SonarQube SCA analysis
+    jobs:
+      - job: SonarQube
+        displayName: Analyze source and dependencies
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - task: SonarQubePrepare@7
+            displayName: Prepare SonarQube analysis
+            inputs:
+              SonarQube: $(sonarQubeServiceConnection)
+              scannerMode: cli
+              configMode: manual
+              cliProjectKey: $(sonarProjectKey)
+              cliProjectName: db-health-check
+              cliSources: .
+              extraProperties: |
+                sonar.python.version=$(pythonVersion)
+                sonar.exclusions=**/.venv/**,**/venv/**,**/__pycache__/**
+          - task: SonarQubeAnalyze@7
+            displayName: Run SonarQube analysis
+          - task: SonarQubePublish@7
+            displayName: Publish SonarQube quality gate
+            inputs:
+              pollingTimeoutSec: '300'
+
+  - stage: BuildImage
+    displayName: Build Docker image
+    dependsOn:
+      - UnitTests
+      - Lint
+      - SecretScan
+      - SonarQube
+    condition: succeeded()
+    jobs:
+      - job: BuildImage
+        displayName: Build image for security scanning
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
           - task: Docker@2
-            displayName: Build image for validation
+            displayName: Build commit-tagged image
             inputs:
               command: build
               repository: $(imageRepository)
               Dockerfile: Dockerfile
               tags: |
                 $(Build.SourceVersion)
+          - bash: |
+              docker save "$(imageRepository):$(Build.SourceVersion)" \
+                --output "$(Build.ArtifactStagingDirectory)/db-health-check.tar"
+            displayName: Export image for downstream stages
+          - task: PublishPipelineArtifact@1
+            displayName: Publish image artifact
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/db-health-check.tar
+              artifact: db-health-check-image
+
+  - stage: Trivy
+    displayName: Trivy image security scan
+    dependsOn: BuildImage
+    condition: succeeded()
+    jobs:
+      - job: Trivy
+        displayName: Scan built image for vulnerabilities
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - task: DownloadPipelineArtifact@2
+            displayName: Download built image
+            inputs:
+              artifactName: db-health-check-image
+              path: $(Pipeline.Workspace)/db-health-check-image
+          - bash: |
+              set -euo pipefail
+              docker load --input "$(Pipeline.Workspace)/db-health-check-image/db-health-check.tar"
+              docker run --rm \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                aquasec/trivy:$(trivyVersion) \
+                image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed \
+                "$(imageRepository):$(Build.SourceVersion)"
+            displayName: Run Trivy against build image
 
   - stage: Publish
     displayName: Push image to ACR
-    dependsOn: Validate
+    dependsOn: Trivy
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
     jobs:
       - job: Publish
@@ -63,17 +179,27 @@ stages:
           vmImage: ubuntu-latest
         steps:
           - checkout: self
-
-          - task: Docker@2
-            displayName: Build and push image
+          - task: DownloadPipelineArtifact@2
+            displayName: Download scanned image
             inputs:
-              command: buildAndPush
+              artifactName: db-health-check-image
+              path: $(Pipeline.Workspace)/db-health-check-image
+          - task: Docker@2
+            displayName: Log in to ACR
+            inputs:
+              command: login
               containerRegistry: $(dockerServiceConnection)
-              repository: $(imageRepository)
-              Dockerfile: Dockerfile
-              tags: |
-                $(Build.SourceVersion)
-                latest
+
+          - bash: |
+              set -euo pipefail
+              docker load --input "$(Pipeline.Workspace)/db-health-check-image/db-health-check.tar"
+              docker tag "$(imageRepository):$(Build.SourceVersion)" \
+                "$(acrLoginServer)/$(imageRepository):$(Build.SourceVersion)"
+              docker tag "$(imageRepository):$(Build.SourceVersion)" \
+                "$(acrLoginServer)/$(imageRepository):latest"
+              docker push "$(acrLoginServer)/$(imageRepository):$(Build.SourceVersion)"
+              docker push "$(acrLoginServer)/$(imageRepository):latest"
+            displayName: Push scanned image to ACR
 
           - bash: |
               echo "Published $(acrLoginServer)/$(imageRepository):$(Build.SourceVersion)"
