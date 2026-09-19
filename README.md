@@ -1,62 +1,49 @@
 # FastAPI Health Check App
 
-This project is a minimal FastAPI application for a health-check API, containerized with Docker and fronted by Nginx. It includes a PostgreSQL database service and a reverse proxy to demonstrate a simple production-style local stack.
+A containerized FastAPI health-check service with PostgreSQL, Nginx, Azure DevOps CI/CD, Azure Container Registry, and Argo CD GitOps deployment.
 
 ## Features
 
-- FastAPI app with `/` and `/health` endpoints
-- PostgreSQL database service
+- FastAPI endpoints at `/` and `/health`
+- PostgreSQL database health check
 - Nginx reverse proxy
-- Docker Compose orchestration
-- Environment-based configuration for secrets and database settings
-
-## Project Structure
-
-```text
-.
-├── app/
-│   ├── __init__.py
-│   └── main.py
-├── Dockerfile
-├── docker-compose.yml
-├── nginx.conf
-├── requirements.txt
-├── .env.example
-├── .env
-├── .dockerignore
-├── README.md
-└── verify_app.py
-```
+- Docker Compose local development
+- Azure DevOps CI with testing, linting, secret scanning, SCA, SAST, and image publishing
+- Argo CD deployment to dev, UAT, and production
 
 ## Requirements
 
-- Docker
-- Docker Compose
+### Local development
+
+- Docker and Docker Compose
+- Python 3.12 or newer for local validation
+
+### CI/CD and deployment
+
+- Azure DevOps project and agent pool
+- Azure Container Registry
+- Kubernetes cluster with Argo CD
+- Separate GitOps repository containing Helm charts or plain Kubernetes manifests
 
 ## Local Setup
 
-1. Copy the example environment file if needed:
+Copy the example environment file and start the stack:
 
 ```bash
 cp .env.example .env
-```
-
-2. Build and start the stack:
-
-```bash
 docker compose up --build
 ```
 
-3. Access the services:
+Services:
 
-- App: http://localhost:8000
-- Health check: http://localhost:8000/health
-- Nginx: http://localhost
-- PostgreSQL: localhost:5432
+| Service | Address |
+| --- | --- |
+| FastAPI app | http://localhost:8000 |
+| Health check | http://localhost:8000/health |
+| Nginx | http://localhost |
+| PostgreSQL | localhost:5432 |
 
-## Environment Variables
-
-The app uses environment variables defined in `.env`:
+### Environment variables
 
 ```env
 DATABASE_URL=postgresql+asyncpg://appuser:secret@db:5432/healthdb
@@ -65,15 +52,11 @@ POSTGRES_USER=appuser
 POSTGRES_PASSWORD=secret
 ```
 
-Do not commit real secrets into version control. In production, use a secure secret management solution.
+Do not commit real secrets. Use Azure Key Vault or another secure secret store in production.
 
-## API Endpoints
+## API
 
-### GET /
-
-Returns a simple welcome message.
-
-Example response:
+### `GET /`
 
 ```json
 {
@@ -81,11 +64,9 @@ Example response:
 }
 ```
 
-### GET /health
+### `GET /health`
 
-Returns the health status of the application and the database connection.
-
-Example response:
+Returns the application and database status:
 
 ```json
 {
@@ -94,12 +75,100 @@ Example response:
 }
 ```
 
-## Notes
+## CI Pipeline
 
-- The app is intentionally simple and meant to be a base for containerization and infrastructure planning.
-- A multi-stage Docker build is used to keep the final image smaller.
-- Nginx is configured as a reverse proxy to the FastAPI container.
+Pipeline file: [task-2-ci-cd/azure-pipelines-ci.yml](task-2-ci-cd/azure-pipelines-ci.yml)
 
-## CI/CD and Deployment Reference
+The pipeline runs for pull requests and pushes to `main`:
 
-The complete project, Azure DevOps CI/CD, ACR, and Argo CD configuration is documented in [`readme.yaml`](readme.yaml). The pipeline files are under `task-2-ci-cd/`.
+| Stage | Purpose |
+| --- | --- |
+| `UnitTests` | Install dependencies and run `pytest`. |
+| `Lint` | Run Ruff and Python compilation checks. |
+| `SecretScan` | Scan the complete Git history with Gitleaks. Any detected secret fails the pipeline. |
+| `SonarQube` | Run SonarQube source and dependency analysis and publish the quality gate. |
+| `BuildImage` | Build the commit-tagged Docker image once and export it as a pipeline artifact. |
+| `Trivy` | Scan the exact exported image. Unfixed HIGH or CRITICAL vulnerabilities fail the pipeline. |
+| `Publish` | Push the scanned image to ACR from `main` only. |
+
+The image is tagged with both the commit SHA and `latest`. The same image artifact is built, scanned, and published; it is not rebuilt between security scanning and publishing.
+
+### Azure DevOps CI configuration
+
+Create these service connections and variables:
+
+- Docker Registry service connection: `acr-service-connection`
+- SonarQube service connection: `sonarqube-service-connection`
+- Pipeline variable: `ACR_LOGIN_SERVER`, such as `myregistry.azurecr.io`
+- Pipeline variable: `SONAR_PROJECT_KEY`
+
+Install the Azure DevOps `Docker` and `SonarQube` extensions. Pin or review the Gitleaks and Trivy versions in the pipeline before production use.
+
+## CD Pipeline
+
+Pipeline file: [task-2-ci-cd/azure-pipelines-cd.yml](task-2-ci-cd/azure-pipelines-cd.yml)
+
+The CD pipeline starts after a successful `db-health-check-ci` run on `main`:
+
+1. Wait for manual production approval.
+2. Clone the external GitOps repository.
+3. Update the newly built ACR image reference.
+4. Commit and push the GitOps change.
+
+Create an Azure DevOps variable group named `db-health-check-cd`:
+
+| Variable | Description |
+| --- | --- |
+| `GITOPS_REPOSITORY` | HTTPS clone URL of the external GitOps repository. |
+| `GITOPS_BRANCH` | Branch watched by Argo CD, normally `main`. |
+| `GITOPS_TOKEN` | Secret Azure DevOps PAT with repository push permission. |
+| `GITOPS_UPDATE_MODE` | `helm-values` or `manifest`. |
+| `GITOPS_FILE` | Path to the target `values.yaml` or Kubernetes manifest. |
+
+Update modes:
+
+- `helm-values`: updates the first `repository` and `tag` fields in the selected values file.
+- `manifest`: updates the first `image` field in the selected Kubernetes manifest.
+
+The GitOps commit uses `[skip ci]` to prevent a recursive image build.
+
+## Argo CD GitOps
+
+Application definitions: [task-2-ci-cd/gitops/argocd/application.yaml](task-2-ci-cd/gitops/argocd/application.yaml)
+
+Replace the example Azure DevOps URL in that file with the external GitOps repository. The repository should expose these paths:
+
+```text
+environments/dev
+environments/uat
+environments/prod
+```
+
+| Environment | Namespace | Sync behavior |
+| --- | --- | --- |
+| Dev | `db-health-check-dev` | Automated sync, self-heal, and prune. |
+| UAT | `db-health-check-uat` | Automated sync, self-heal, and prune. |
+| Production | `db-health-check-prod` | No automated sync. An operator manually reviews and syncs the approved change. |
+
+Each environment may contain a Helm chart or plain Kubernetes manifests. Kustomize is not required.
+
+## Repository Structure
+
+```text
+.
+├── app/
+│   ├── __init__.py
+│   └── main.py
+├── tests/
+│   └── test_app.py
+├── task-2-ci-cd/
+│   ├── azure-pipelines-ci.yml
+│   ├── azure-pipelines-cd.yml
+│   └── gitops/argocd/application.yaml
+├── Dockerfile
+├── docker-compose.yml
+├── nginx.conf
+├── requirements.txt
+├── verify_app.py
+└── README.md
+```
