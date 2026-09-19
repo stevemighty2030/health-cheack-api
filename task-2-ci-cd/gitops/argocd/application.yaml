@@ -1,3 +1,5 @@
+# Replace the example Azure DevOps URL with the external GitOps repository.
+# Dev and UAT reconcile automatically after the CD pipeline updates GitOps.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -13,6 +15,7 @@ spec:
     server: https://kubernetes.default.svc
     namespace: db-health-check-dev
   syncPolicy:
+    # Keep lower environments continuously reconciled.
     automated:
       prune: true
       selfHeal: true
@@ -34,6 +37,7 @@ spec:
     server: https://kubernetes.default.svc
     namespace: db-health-check-uat
   syncPolicy:
+    # UAT follows the same automatic GitOps flow as development.
     automated:
       prune: true
       selfHeal: true
@@ -54,3 +58,5 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: db-health-check-prod
+  # Production intentionally has no automated sync policy.
+  # An operator must review and sync the approved GitOps change manually.
