@@ -90,9 +90,10 @@ The pipeline runs for pull requests and pushes to `main`:
 | `SAST` | Use Snyk to scan `requirements.txt` for third-party dependency vulnerabilities at all severity levels. Any finding fails the pipeline. |
 | `BuildImage` | Build the commit-tagged Docker image once and export it as a pipeline artifact. |
 | `Trivy` | Scan the exact exported image for all vulnerabilities. Any vulnerability exits with code `1` and fails the pipeline. |
+| `SignImage` | Sign and verify the exact exported image artifact with Cosign before publishing. |
 | `Publish` | Push the scanned image to ACR from `main` only. |
 
-The image is tagged with both the commit SHA and `latest`. The same image artifact is built, scanned, and published; it is not rebuilt between security scanning and publishing. Gitleaks and Trivy are blocking gates, so the image cannot reach ACR when either scan finds a finding.
+The image is tagged with both the commit SHA and `latest`. The same image artifact is built, scanned, signed, and published; it is not rebuilt between security scanning and publishing. Gitleaks and Trivy are blocking gates, so the image cannot reach ACR when either scan finds a finding.
 
 ### Azure DevOps CI configuration
 
@@ -103,8 +104,11 @@ Create these service connections and variables:
 - Pipeline variable: `ACR_LOGIN_SERVER`, such as `myregistry.azurecr.io`
 - Pipeline variable: `SONAR_PROJECT_KEY`
 - Secret pipeline variable: `SNYK_TOKEN`
+- Secret pipeline variables: `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD`, and `COSIGN_PUBLIC_KEY`
 
-Install the Azure DevOps `Docker` and `SonarQube` extensions. Review the Gitleaks, Snyk, and Trivy scanner versions before production use. The Snyk `SAST` stage runs before `BuildImage`, and its nonzero exit code prevents both image construction and ACR publishing when a third-party dependency vulnerability is found.
+Install the Azure DevOps `Docker` and `SonarQube` extensions. Review the Gitleaks, Snyk, Trivy, and Cosign versions before production use. The Snyk `SAST` stage runs before `BuildImage`, and its nonzero exit code prevents both image construction and ACR publishing when a third-party dependency vulnerability is found. The `SignImage` stage signs and verifies the same image artifact that `Publish` later pushes to ACR.
+
+Cosign uses `sign-blob` and `verify-blob` for the exported image tarball. The detached signature is published as a pipeline artifact, and CD verifies it again with `COSIGN_PUBLIC_KEY` before any GitOps update. This protects the CI artifact handoff; it is separate from registry-based Cosign signing and verification by image digest.
 
 ## CD Pipeline
 
@@ -112,10 +116,16 @@ Pipeline file: [task-2-ci-cd/azure-pipelines-cd.yml](task-2-ci-cd/azure-pipeline
 
 The CD pipeline starts after a successful `db-health-check-ci` run on `main`:
 
-1. Wait for manual production approval.
-2. Clone the external GitOps repository.
-3. Update the newly built ACR image reference.
-4. Commit and push the GitOps change.
+```text
+VerifyImage -> DeployDev -> DeployUat -> Approval -> DeployProd
+```
+
+1. Download the image and Cosign signature from the exact CI run.
+2. Verify that the signature matches the image artifact.
+3. Update and commit the dev GitOps file. Argo CD auto-syncs dev.
+4. Update and commit the UAT GitOps file. Argo CD auto-syncs UAT.
+5. Wait for manual production approval.
+6. Update and commit the production GitOps file. Production requires a manual Argo CD sync.
 
 Create an Azure DevOps variable group named `db-health-check-cd`:
 
@@ -125,14 +135,17 @@ Create an Azure DevOps variable group named `db-health-check-cd`:
 | `GITOPS_BRANCH` | Branch watched by Argo CD, normally `main`. |
 | `GITOPS_TOKEN` | Secret Azure DevOps PAT with repository push permission. |
 | `GITOPS_UPDATE_MODE` | `helm-values` or `manifest`. |
-| `GITOPS_FILE` | Path to the target `values.yaml` or Kubernetes manifest. |
+| `GITOPS_FILE_DEV` | Path to the dev `values.yaml` or Kubernetes manifest. |
+| `GITOPS_FILE_UAT` | Path to the UAT `values.yaml` or Kubernetes manifest. |
+| `GITOPS_FILE_PROD` | Path to the production `values.yaml` or Kubernetes manifest. |
+| `COSIGN_PUBLIC_KEY` | Public key used to verify the signature created by CI. |
 
 Update modes:
 
 - `helm-values`: updates the first `repository` and `tag` fields in the selected values file.
 - `manifest`: updates the first `image` field in the selected Kubernetes manifest.
 
-The GitOps commit uses `[skip ci]` to prevent a recursive image build.
+The CD pipeline verifies the Cosign signature against the exact image tarball from the triggering CI run before changing GitOps. Missing artifacts or a mismatched signature fail CD. Dev and UAT are updated before the production approval gate. The GitOps commit uses `[skip ci]` to prevent a recursive image build.
 
 ## Argo CD GitOps
 

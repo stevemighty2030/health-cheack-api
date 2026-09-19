@@ -2,7 +2,7 @@
 # Required setup:
 #   - Docker Registry service connection: acr-service-connection
 #   - SonarQube service connection: sonarqube-service-connection
-#   - Secret pipeline variable: SNYK_TOKEN
+#   - Secret pipeline variables: SNYK_TOKEN, COSIGN_PRIVATE_KEY, COSIGN_PASSWORD, COSIGN_PUBLIC_KEY
 #   - Pipeline variables: ACR_LOGIN_SERVER and SONAR_PROJECT_KEY
 
 trigger:
@@ -25,6 +25,7 @@ variables:
   sonarProjectKey: '$(SONAR_PROJECT_KEY)'
   gitleaksVersion: '8.28.0'
   trivyVersion: '0.65.0'
+  cosignVersion: '2.4.1'
 
 stages:
   # Fast feedback gate for every pull request and main branch build.
@@ -127,6 +128,8 @@ stages:
         steps:
           - checkout: self
           - bash: |
+              # Sign the exact tarball produced by BuildImage and scanned by Trivy.
+              # The private key stays in Azure DevOps secret variables.
               set -euo pipefail
               docker run --rm \
                 -e SNYK_TOKEN \
@@ -193,6 +196,8 @@ stages:
               artifactName: db-health-check-image
               path: $(Pipeline.Workspace)/db-health-check-image
           - bash: |
+              # Fail CI if the signature does not match the image tarball.
+              # This is a detached artifact signature, not a registry signature.
               set -euo pipefail
               docker load --input "$(Pipeline.Workspace)/db-health-check-image/db-health-check.tar"
               docker run --rm \
@@ -202,10 +207,63 @@ stages:
                 "$(imageRepository):$(Build.SourceVersion)"
             displayName: Run Trivy against build image
 
-  # Only main publishes the already-scanned image to ACR.
+  # Sign the exact image artifact before it is allowed to reach ACR.
+  # This creates a detached Cosign signature for the exported image tarball.
+  - stage: SignImage
+    displayName: Sign image with Cosign
+    dependsOn: Trivy
+    condition: succeeded()
+    jobs:
+      - job: SignImage
+        displayName: Create and verify Cosign signature
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - task: DownloadPipelineArtifact@2
+            displayName: Download scanned image
+            inputs:
+              artifactName: db-health-check-image
+              path: $(Pipeline.Workspace)/db-health-check-image
+          - bash: |
+              set -euo pipefail
+              docker run --rm \
+                -e COSIGN_PRIVATE_KEY \
+                -e COSIGN_PASSWORD \
+                -v "$(Pipeline.Workspace)/db-health-check-image:/workspace" \
+                gcr.io/projectsigstore/cosign:v$(cosignVersion) \
+                sign-blob --yes \
+                --key env://COSIGN_PRIVATE_KEY \
+                --output-signature /workspace/db-health-check.tar.sig \
+                /workspace/db-health-check.tar
+            displayName: Sign exported image artifact
+            env:
+              COSIGN_PRIVATE_KEY: $(COSIGN_PRIVATE_KEY)
+              COSIGN_PASSWORD: $(COSIGN_PASSWORD)
+          - bash: |
+              set -euo pipefail
+              docker run --rm \
+                -e COSIGN_PUBLIC_KEY \
+                -v "$(Pipeline.Workspace)/db-health-check-image:/workspace" \
+                gcr.io/projectsigstore/cosign:v$(cosignVersion) \
+                verify-blob \
+                --key env://COSIGN_PUBLIC_KEY \
+                --signature /workspace/db-health-check.tar.sig \
+                /workspace/db-health-check.tar
+            displayName: Verify Cosign signature before publish
+            env:
+              COSIGN_PUBLIC_KEY: $(COSIGN_PUBLIC_KEY)
+          - task: PublishPipelineArtifact@1
+            # CD downloads this signature from the same CI run and verifies it again.
+            displayName: Publish Cosign signature artifact
+            inputs:
+              targetPath: $(Pipeline.Workspace)/db-health-check-image/db-health-check.tar.sig
+              artifact: db-health-check-signature
+
+  # Only main publishes the already-scanned and signed image to ACR.
   - stage: Publish
     displayName: Push image to ACR
-    dependsOn: Trivy
+    dependsOn: SignImage
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
     jobs:
       - job: Publish
@@ -219,12 +277,19 @@ stages:
             inputs:
               artifactName: db-health-check-image
               path: $(Pipeline.Workspace)/db-health-check-image
+          - task: DownloadPipelineArtifact@2
+            displayName: Download verified image signature
+            inputs:
+              artifactName: db-health-check-signature
+              path: $(Pipeline.Workspace)/db-health-check-signature
+          - bash: |
+              test -s "$(Pipeline.Workspace)/db-health-check-signature/db-health-check.tar.sig"
+            displayName: Require verified Cosign signature
           - task: Docker@2
             displayName: Log in to ACR
             inputs:
               command: login
               containerRegistry: $(dockerServiceConnection)
-
           - bash: |
               set -euo pipefail
               docker load --input "$(Pipeline.Workspace)/db-health-check-image/db-health-check.tar"
@@ -234,8 +299,7 @@ stages:
                 "$(acrLoginServer)/$(imageRepository):latest"
               docker push "$(acrLoginServer)/$(imageRepository):$(Build.SourceVersion)"
               docker push "$(acrLoginServer)/$(imageRepository):latest"
-            displayName: Push scanned image to ACR
-
+            displayName: Push signed image to ACR
           - bash: |
               echo "Published $(acrLoginServer)/$(imageRepository):$(Build.SourceVersion)"
             displayName: Report published image
